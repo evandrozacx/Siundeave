@@ -1,0 +1,6 @@
+{
+  "name": "SoundWave",
+  "description": "Aplicativo PWA e Android para busca, reprodução e download de músicas em fontes abertas e torrents.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
