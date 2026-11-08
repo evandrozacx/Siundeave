@@ -22,7 +22,7 @@ object AppUpdateManager {
   private const val KEY_GITHUB_REPO = "github_update_repo"
 
   // Default repository fallback if none entered yet
-  const val DEFAULT_GITHUB_REPO = "comercialemds/SoundWave"
+  const val DEFAULT_GITHUB_REPO = "evandrozacx/Siundeave"
 
   var pendingApkPath: String? = null
 
@@ -36,17 +36,30 @@ object AppUpdateManager {
       val changelog: String,
       val releaseName: String,
       val publishedAt: String,
-      val repoName: String
+      val repoName: String,
+      val statusMessage: String = "",
+      val statusReason: String = "UNKNOWN"
   )
+
+  data class HttpResponse(val code: Int, val body: String?, val error: String? = null)
+
+  fun cleanRepo(repo: String): String {
+    return repo.trim()
+        .replace("https://github.com/", "", ignoreCase = true)
+        .replace("http://github.com/", "", ignoreCase = true)
+        .replace("github.com/", "", ignoreCase = true)
+        .replace(".git", "", ignoreCase = true)
+        .trim('/')
+  }
 
   fun getGitHubRepo(context: Context): String {
     val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     val saved = prefs.getString(KEY_GITHUB_REPO, null)
-    return if (!saved.isNullOrBlank()) saved.trim() else DEFAULT_GITHUB_REPO
+    return if (!saved.isNullOrBlank()) cleanRepo(saved) else DEFAULT_GITHUB_REPO
   }
 
   fun setGitHubRepo(context: Context, repo: String) {
-    val clean = repo.trim().removePrefix("https://github.com/").removeSuffix(".git")
+    val clean = cleanRepo(repo)
     val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     prefs.edit().putString(KEY_GITHUB_REPO, clean).apply()
   }
@@ -56,12 +69,72 @@ object AppUpdateManager {
 
   /**
    * Checks GitHub for the latest release or version.json.
-   * Handles both GitHub Releases API and Raw version.json fallback.
+   * Provides deep diagnostics for repo existence, release existence, and APK assets.
    */
   fun checkForUpdate(context: Context, customRepo: String? = null): UpdateInfo {
-    val repo = (customRepo ?: getGitHubRepo(context)).trim().removePrefix("https://github.com/").removeSuffix(".git")
+    val rawRepo = customRepo ?: getGitHubRepo(context)
+    var repo = cleanRepo(rawRepo)
     val curName = getCurrentVersionName()
     val curCode = getCurrentVersionCode()
+
+    if (repo.isEmpty() || !repo.contains("/")) {
+      return UpdateInfo(
+          hasUpdate = false,
+          currentVersionName = curName,
+          currentVersionCode = curCode,
+          latestVersionName = curName,
+          latestVersionCode = curCode,
+          downloadUrl = "",
+          changelog = "",
+          releaseName = "",
+          publishedAt = "",
+          repoName = repo,
+          statusMessage = "Por favor, informe seu repositório no formato usuario/repositorio (ex: evandrozacx/Siundeave).",
+          statusReason = "REPO_INVALID"
+      )
+    }
+
+    // 0. Verify if repository exists (with fallback candidate probes)
+    var repoMetaResp = httpGet("https://api.github.com/repos/$repo")
+    if (repoMetaResp.code == 404) {
+      // Try alternate candidate names in case of typo (e.g. Siundeave vs SoundWave vs Soundwave)
+      val candidates = mutableListOf<String>()
+      val owner = repo.substringBefore("/")
+      val repoName = repo.substringAfter("/")
+      candidates.add("$owner/SoundWave")
+      candidates.add("$owner/soundwave")
+      candidates.add("$owner/Siundeave")
+      candidates.add("$owner/siundeave")
+      candidates.add("$owner/Soundwave")
+
+      for (cand in candidates) {
+        if (cand.equals(repo, ignoreCase = true)) continue
+        val candResp = httpGet("https://api.github.com/repos/$cand")
+        if (candResp.code in 200..299) {
+          repo = cand
+          repoMetaResp = candResp
+          setGitHubRepo(context, cand)
+          break
+        }
+      }
+    }
+
+    if (repoMetaResp.code == 404) {
+      return UpdateInfo(
+          hasUpdate = false,
+          currentVersionName = curName,
+          currentVersionCode = curCode,
+          latestVersionName = curName,
+          latestVersionCode = curCode,
+          downloadUrl = "",
+          changelog = "",
+          releaseName = "",
+          publishedAt = "",
+          repoName = repo,
+          statusMessage = "O repositório '$repo' não foi encontrado no GitHub (404). Crie o repositório no seu GitHub (https://github.com/new) ou verifique se ele é público.",
+          statusReason = "REPO_NOT_FOUND"
+      )
+    }
 
     var latestVersion = curName
     var latestCode = curCode
@@ -69,19 +142,22 @@ object AppUpdateManager {
     var changelog = ""
     var releaseName = ""
     var publishedAt = ""
+    var hasReleaseObject = false
+    var hasApkInRelease = false
 
-    // 1. Try GitHub Releases API first
+    // 1. Try GitHub Releases API
     try {
       val apiUrl = "https://api.github.com/repos/$repo/releases/latest"
-      val jsonStr = httpGet(apiUrl)
-      if (!jsonStr.isNullOrEmpty()) {
-        val json = JSONObject(jsonStr)
+      val releaseResp = httpGet(apiUrl)
+      if (releaseResp.code in 200..299 && !releaseResp.body.isNullOrEmpty()) {
+        hasReleaseObject = true
+        val json = JSONObject(releaseResp.body)
         val tagName = json.optString("tag_name", "").removePrefix("v").trim()
         releaseName = json.optString("name", "SoundWave $tagName")
         changelog = json.optString("body", "")
         publishedAt = json.optString("published_at", "")
 
-        latestVersion = if (tagName.isNotEmpty()) tagName else curName
+        if (tagName.isNotEmpty()) latestVersion = tagName
 
         // Search for .apk asset in release
         val assets = json.optJSONArray("assets") ?: JSONArray()
@@ -90,6 +166,7 @@ object AppUpdateManager {
           val name = asset.optString("name", "")
           if (name.endsWith(".apk", ignoreCase = true)) {
             downloadUrl = asset.optString("browser_download_url", "")
+            hasApkInRelease = true
             break
           }
         }
@@ -106,9 +183,9 @@ object AppUpdateManager {
             "https://raw.githubusercontent.com/$repo/master/version.json"
         )
         for (rawUrl in rawUrls) {
-          val rawJsonStr = httpGet(rawUrl)
-          if (!rawJsonStr.isNullOrEmpty()) {
-            val rawJson = JSONObject(rawJsonStr)
+          val rawResp = httpGet(rawUrl)
+          if (rawResp.code in 200..299 && !rawResp.body.isNullOrEmpty()) {
+            val rawJson = JSONObject(rawResp.body)
             val vName = rawJson.optString("versionName", "").removePrefix("v").trim()
             val vCode = rawJson.optInt("versionCode", 0)
             if (vName.isNotEmpty()) {
@@ -117,9 +194,18 @@ object AppUpdateManager {
               if (releaseName.isEmpty()) releaseName = rawJson.optString("releaseName", "SoundWave v$vName")
               if (changelog.isEmpty()) changelog = rawJson.optString("changelog", "")
               if (publishedAt.isEmpty()) publishedAt = rawJson.optString("releaseDate", "")
+
               val rawApkUrl = rawJson.optString("apkUrl", "")
               if (rawApkUrl.isNotEmpty()) {
                 downloadUrl = rawApkUrl
+              } else {
+                // Try if soundwave.apk or specified apkName exists in raw repo
+                val apkName = rawJson.optString("apkName", "soundwave.apk")
+                val probeApkUrl = "https://raw.githubusercontent.com/$repo/main/$apkName"
+                val apkHeadResp = httpGet(probeApkUrl)
+                if (apkHeadResp.code in 200..299) {
+                  downloadUrl = probeApkUrl
+                }
               }
               break
             }
@@ -130,9 +216,36 @@ object AppUpdateManager {
       }
     }
 
-    // Determine if update is available
+    // Determine status reason & user-friendly message
     val isNewer = isVersionGreater(latestVersion, curName) || (latestCode > curCode)
     val hasUpdate = isNewer && downloadUrl.isNotEmpty()
+
+    val (statusReason, statusMessage) = when {
+      hasUpdate -> {
+        Pair("UPDATE_AVAILABLE", "🚀 Nova versão v$latestVersion disponível para atualização imediata!")
+      }
+      hasReleaseObject && !hasApkInRelease -> {
+        Pair(
+            "NO_APK_IN_RELEASE",
+            "Release 'v$latestVersion' encontrada no GitHub, mas nenhum arquivo .apk foi anexado a ela. Arraste o APK para a Release no GitHub para que os usuários possam atualizar."
+        )
+      }
+      !hasReleaseObject && downloadUrl.isEmpty() -> {
+        Pair(
+            "NO_RELEASES",
+            "O código está no GitHub, mas nenhuma Release pública foi criada ainda. Para o app atualizar sozinho, crie uma Release (ex: v1.2.0) e anexe o arquivo .apk nela."
+        )
+      }
+      !isNewer -> {
+        Pair(
+            "ALREADY_UPDATED",
+            "Você já está na versão mais recente instalada (v$curName). Para disparar uma atualização para os usuários, aumente o número da versão (ex: v1.2.0) e crie uma nova Release com o APK."
+        )
+      }
+      else -> {
+        Pair("NO_DOWNLOAD_URL", "Versão v$latestVersion encontrada, mas o link direto do APK não está disponível.")
+      }
+    }
 
     return UpdateInfo(
         hasUpdate = hasUpdate,
@@ -144,7 +257,9 @@ object AppUpdateManager {
         changelog = changelog.ifEmpty { "Novas melhorias e correções no SoundWave." },
         releaseName = releaseName.ifEmpty { "SoundWave v$latestVersion" },
         publishedAt = publishedAt,
-        repoName = repo
+        repoName = repo,
+        statusMessage = statusMessage,
+        statusReason = statusReason
     )
   }
 
@@ -310,24 +425,27 @@ object AppUpdateManager {
     }
   }
 
-  private fun httpGet(urlStr: String): String? {
+  fun httpGet(urlStr: String): HttpResponse {
     var conn: HttpURLConnection? = null
     return try {
       val url = URL(urlStr)
       conn = (url.openConnection() as HttpURLConnection).apply {
         connectTimeout = 8000
         readTimeout = 8000
-        setRequestProperty("User-Agent", "SoundWave-Updater")
-        setRequestProperty("Accept", "application/vnd.github.v3+json, application/json")
+        instanceFollowRedirects = true
+        setRequestProperty("User-Agent", "Mozilla/5.0 SoundWave-Updater/1.1")
+        setRequestProperty("Accept", "application/vnd.github.v3+json, application/json, */*")
       }
-      if (conn.responseCode in 200..299) {
-        conn.inputStream.bufferedReader().use { it.readText() }
+      val code = conn.responseCode
+      if (code in 200..299) {
+        val text = conn.inputStream.bufferedReader().use { it.readText() }
+        HttpResponse(code, text)
       } else {
-        null
+        HttpResponse(code, null, "HTTP $code")
       }
     } catch (e: Exception) {
       Log.d(TAG, "HTTP GET failed for $urlStr: ${e.message}")
-      null
+      HttpResponse(-1, null, e.message)
     } finally {
       conn?.disconnect()
     }

@@ -2411,6 +2411,8 @@ class MainActivity : ComponentActivity() {
             put("releaseName", updateInfo.releaseName)
             put("publishedAt", updateInfo.publishedAt)
             put("repoName", updateInfo.repoName)
+            put("statusMessage", updateInfo.statusMessage)
+            put("statusReason", updateInfo.statusReason)
           }
           val jsonString = json.toString().replace("\\", "\\\\").replace("'", "\\'")
           runOnUiThread {
