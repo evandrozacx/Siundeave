@@ -1,0 +1,6 @@
+{
+  "summary": "Plano de implementação atualizado: Tela Descobrir definida como padrão de abertura, player configurado para tocar estritamente sequências por gênero musical no streaming do YouTube com fila contínua infinita (sem parar), e reprodução por pasta local isolada com suporte a modo aleatório total integrando todas as pastas.",
+  "updatedAt": "2026-11-06T13:55:34.800302670Z",
+  "requestFeedback": true,
+  "userFacing": true
+}

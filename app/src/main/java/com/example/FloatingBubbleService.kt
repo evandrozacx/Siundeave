@@ -1,10 +1,16 @@
 package com.example
 
 import android.annotation.SuppressLint
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.Outline
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
@@ -14,11 +20,19 @@ import android.util.Log
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewOutlineProvider
 import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.ImageView
+import android.widget.LinearLayout
 import android.widget.TextView
 import kotlin.math.abs
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class FloatingBubbleService : Service() {
 
@@ -29,16 +43,23 @@ class FloatingBubbleService : Service() {
 
     const val EXTRA_TRACK_TITLE = "extra_track_title"
     const val EXTRA_IS_PLAYING = "extra_is_playing"
+    const val EXTRA_COVER_URL = "extra_cover_url"
 
     var isBubbleShowing = false
       private set
 
-    fun show(context: Context, trackTitle: String? = null, isPlaying: Boolean = true) {
+    fun show(
+        context: Context,
+        trackTitle: String? = null,
+        isPlaying: Boolean = true,
+        coverUrl: String? = null
+    ) {
       if (!Settings.canDrawOverlays(context)) return
       val intent = Intent(context, FloatingBubbleService::class.java).apply {
         action = ACTION_SHOW_BUBBLE
         putExtra(EXTRA_TRACK_TITLE, trackTitle)
         putExtra(EXTRA_IS_PLAYING, isPlaying)
+        putExtra(EXTRA_COVER_URL, coverUrl)
       }
       try {
         context.startService(intent)
@@ -58,12 +79,18 @@ class FloatingBubbleService : Service() {
       }
     }
 
-    fun update(context: Context, trackTitle: String, isPlaying: Boolean) {
+    fun update(
+        context: Context,
+        trackTitle: String,
+        isPlaying: Boolean,
+        coverUrl: String? = null
+    ) {
       if (!isBubbleShowing) return
       val intent = Intent(context, FloatingBubbleService::class.java).apply {
         action = ACTION_UPDATE_INFO
         putExtra(EXTRA_TRACK_TITLE, trackTitle)
         putExtra(EXTRA_IS_PLAYING, isPlaying)
+        putExtra(EXTRA_COVER_URL, coverUrl)
       }
       try {
         context.startService(intent)
@@ -74,6 +101,14 @@ class FloatingBubbleService : Service() {
   private var windowManager: WindowManager? = null
   private var bubbleView: View? = null
   private var params: WindowManager.LayoutParams? = null
+  private var titleTextView: TextView? = null
+  private var playPauseBtnView: ImageView? = null
+  private var indicatorView: View? = null
+  private var coverImageView: ImageView? = null
+
+  private val serviceScope = CoroutineScope(Dispatchers.IO + Job())
+  private var currentCoverUrl: String? = null
+  private var currentCoverBitmap: Bitmap? = null
 
   private var initialX = 0
   private var initialY = 0
@@ -91,21 +126,21 @@ class FloatingBubbleService : Service() {
   private fun startForegroundIfNeeded() {
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
       val channelId = "soundwave_bubble_channel"
-      val manager = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
-      val channel = android.app.NotificationChannel(
+      val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+      val channel = NotificationChannel(
           channelId,
-          "Balão Flutuante",
-          android.app.NotificationManager.IMPORTANCE_MIN
+          "Mini Player Flutuante",
+          NotificationManager.IMPORTANCE_MIN
       ).apply {
-        description = "Balão Flutuante SoundWave"
+        description = "Mini Player Flutuante SoundWave em Segundo Plano"
         setShowBadge(false)
       }
       manager.createNotificationChannel(channel)
 
-      val notification = android.app.Notification.Builder(this, channelId)
+      val notification = Notification.Builder(this, channelId)
           .setSmallIcon(R.drawable.ic_notif_music)
           .setContentTitle("SoundWave")
-          .setContentText("Balão flutuante ativo")
+          .setContentText("Mini player em segundo plano ativo")
           .setOngoing(true)
           .build()
 
@@ -114,7 +149,7 @@ class FloatingBubbleService : Service() {
           startForeground(
               1002,
               notification,
-              android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+              ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
           )
         } else {
           startForeground(1002, notification)
@@ -136,34 +171,37 @@ class FloatingBubbleService : Service() {
       ACTION_SHOW_BUBBLE -> {
         val title = intent.getStringExtra(EXTRA_TRACK_TITLE) ?: "SoundWave"
         val isPlaying = intent.getBooleanExtra(EXTRA_IS_PLAYING, true)
-        createOrUpdateBubble(title, isPlaying)
+        val coverUrl = intent.getStringExtra(EXTRA_COVER_URL)
+        createOrUpdateBubble(title, isPlaying, coverUrl)
       }
       ACTION_UPDATE_INFO -> {
         val title = intent.getStringExtra(EXTRA_TRACK_TITLE) ?: "SoundWave"
         val isPlaying = intent.getBooleanExtra(EXTRA_IS_PLAYING, true)
-        updateBubbleState(title, isPlaying)
+        val coverUrl = intent.getStringExtra(EXTRA_COVER_URL)
+        updateBubbleState(title, isPlaying, coverUrl)
       }
       else -> {
-        createOrUpdateBubble("SoundWave", true)
+        createOrUpdateBubble("SoundWave", true, null)
       }
     }
     return START_STICKY
   }
 
   @SuppressLint("ClickableViewAccessibility")
-  private fun createOrUpdateBubble(title: String, isPlaying: Boolean) {
+  private fun createOrUpdateBubble(title: String, isPlaying: Boolean, coverUrl: String?) {
     if (!Settings.canDrawOverlays(this)) {
       stopSelf()
       return
     }
 
     if (bubbleView != null) {
-      updateBubbleState(title, isPlaying)
+      updateBubbleState(title, isPlaying, coverUrl)
       return
     }
 
     val density = resources.displayMetrics.density
-    val bubbleSize = (58 * density).toInt()
+    val miniWidth = (240 * density).toInt()
+    val miniHeight = (54 * density).toInt()
 
     val layoutType =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -175,66 +213,130 @@ class FloatingBubbleService : Service() {
 
     val windowParams =
         WindowManager.LayoutParams(
-            bubbleSize,
-            bubbleSize,
+            miniWidth,
+            miniHeight,
             layoutType,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
         ).apply {
           gravity = Gravity.TOP or Gravity.START
-          x = 20
-          y = (resources.displayMetrics.heightPixels * 0.45).toInt()
+          x = 16
+          y = (resources.displayMetrics.heightPixels * 0.12).toInt().coerceAtLeast(32)
         }
     this.params = windowParams
 
-    // Build the Bubble View layout programmatically for maximum speed & independence
-    val container = FrameLayout(this).apply {
-      layoutParams = FrameLayout.LayoutParams(bubbleSize, bubbleSize)
+    // Build a compact Floating Mini-Player Pill programmatically
+    val container = LinearLayout(this).apply {
+      orientation = LinearLayout.HORIZONTAL
+      gravity = Gravity.CENTER_VERTICAL
+      layoutParams = FrameLayout.LayoutParams(miniWidth, miniHeight)
+      val padH = (10 * density).toInt()
+      val padV = (6 * density).toInt()
+      setPadding(padH, padV, padH, padV)
 
-      // Outer circular background with emerald border and dark glossy center
       val bgDrawable = GradientDrawable().apply {
-        shape = GradientDrawable.OVAL
-        colors = intArrayOf(Color.parseColor("#10B981"), Color.parseColor("#064E3B"))
-        gradientType = GradientDrawable.RADIAL_GRADIENT
-        gradientRadius = (bubbleSize * 0.8f)
-        setStroke((2 * density).toInt(), Color.parseColor("#34D399"))
+        shape = GradientDrawable.RECTANGLE
+        cornerRadius = 28 * density
+        colors = intArrayOf(Color.parseColor("#F00F172A"), Color.parseColor("#F5064E3B"))
+        orientation = GradientDrawable.Orientation.LEFT_RIGHT
+        setStroke((1.5f * density).toInt(), Color.parseColor("#34D399"))
       }
       background = bgDrawable
       elevation = 16 * density
     }
 
-    // App logo / music icon inside the bubble
+    // Left icon + status dot wrapper
+    val iconWrapper = FrameLayout(this).apply {
+      val wrapSize = (38 * density).toInt()
+      layoutParams = LinearLayout.LayoutParams(wrapSize, wrapSize).apply {
+        marginEnd = (8 * density).toInt()
+      }
+    }
+
     val iconView = ImageView(this).apply {
-      val iconSize = (32 * density).toInt()
-      val lp = FrameLayout.LayoutParams(iconSize, iconSize).apply {
+      val iconSize = (34 * density).toInt()
+      layoutParams = FrameLayout.LayoutParams(iconSize, iconSize).apply {
         gravity = Gravity.CENTER
       }
-      layoutParams = lp
-      setImageResource(R.drawable.soundwave_icon_1793581483680)
-      scaleType = ImageView.ScaleType.FIT_CENTER
-    }
-    container.addView(iconView)
-
-    // Pulsing indicator dot if playing
-    val indicator = View(this).apply {
-      id = View.generateViewId()
-      val dotSize = (10 * density).toInt()
-      val lp = FrameLayout.LayoutParams(dotSize, dotSize).apply {
-        gravity = Gravity.TOP or Gravity.END
-        setMargins(0, (4 * density).toInt(), (4 * density).toInt(), 0)
+      scaleType = ImageView.ScaleType.CENTER_CROP
+      outlineProvider = object : ViewOutlineProvider() {
+        override fun getOutline(view: View, outline: Outline) {
+          outline.setRoundRect(0, 0, view.width, view.height, 8 * density)
+        }
       }
-      layoutParams = lp
-      val dotDrawable = GradientDrawable().apply {
+      clipToOutline = true
+      setImageResource(R.drawable.soundwave_icon_1793581483680)
+    }
+    this.coverImageView = iconView
+    iconWrapper.addView(iconView)
+
+    val indicator = View(this).apply {
+      val dotSize = (9 * density).toInt()
+      layoutParams = FrameLayout.LayoutParams(dotSize, dotSize).apply {
+        gravity = Gravity.BOTTOM or Gravity.END
+      }
+      background = GradientDrawable().apply {
         shape = GradientDrawable.OVAL
         setColor(if (isPlaying) Color.parseColor("#1ED760") else Color.parseColor("#9CA3AF"))
         setStroke((1 * density).toInt(), Color.WHITE)
       }
-      background = dotDrawable
     }
-    container.addView(indicator)
+    this.indicatorView = indicator
+    iconWrapper.addView(indicator)
+    container.addView(iconWrapper)
 
-    // Touch and Drag listener
+    // Song title text in the middle
+    val titleTv = TextView(this).apply {
+      layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+        marginEnd = (6 * density).toInt()
+      }
+      text = title
+      setTextColor(Color.WHITE)
+      textSize = 12.5f
+      maxLines = 1
+      ellipsize = android.text.TextUtils.TruncateAt.END
+      paint.isFakeBoldText = true
+    }
+    this.titleTextView = titleTv
+    container.addView(titleTv)
+
+    // Play/Pause button inside the floating mini-player
+    val playPauseBtn = ImageView(this).apply {
+      val btnSize = (34 * density).toInt()
+      layoutParams = LinearLayout.LayoutParams(btnSize, btnSize).apply {
+        marginEnd = (4 * density).toInt()
+      }
+      val pad = (6 * density).toInt()
+      setPadding(pad, pad, pad, pad)
+      setImageResource(if (isPlaying) R.drawable.ic_notif_pause else R.drawable.ic_notif_play)
+      setColorFilter(Color.WHITE)
+      background = GradientDrawable().apply {
+        shape = GradientDrawable.OVAL
+        setColor(Color.parseColor("#3310B981"))
+      }
+      setOnClickListener {
+        MainActivity.instance?.handleMediaAction("ACTION_PLAY_PAUSE")
+      }
+    }
+    this.playPauseBtnView = playPauseBtn
+    container.addView(playPauseBtn)
+
+    // Next track button inside the floating mini-player
+    val nextBtn = ImageView(this).apply {
+      val btnSize = (32 * density).toInt()
+      layoutParams = LinearLayout.LayoutParams(btnSize, btnSize)
+      val pad = (6 * density).toInt()
+      setPadding(pad, pad, pad, pad)
+      setImageResource(R.drawable.ic_notif_next)
+      setColorFilter(Color.WHITE)
+      setOnClickListener {
+        MainActivity.instance?.handleMediaAction("ACTION_NEXT")
+      }
+    }
+    container.addView(nextBtn)
+
+    // Touch and Drag listener on the mini-player pill
     container.setOnTouchListener { _, event ->
       val currentParams = params ?: return@setOnTouchListener false
       when (event.action) {
@@ -244,7 +346,7 @@ class FloatingBubbleService : Service() {
           initialTouchX = event.rawX
           initialTouchY = event.rawY
           isDragging = false
-          container.animate().scaleX(1.1f).scaleY(1.1f).setDuration(120).start()
+          container.animate().scaleX(1.03f).scaleY(1.03f).setDuration(120).start()
           true
         }
         MotionEvent.ACTION_MOVE -> {
@@ -265,10 +367,8 @@ class FloatingBubbleService : Service() {
           val dx = abs(event.rawX - initialTouchX)
           val dy = abs(event.rawY - initialTouchY)
           if (!isDragging && dx < 15 && dy < 15) {
-            // TAP DETECTED! Launch app and bring to foreground
             openAppFromBubble()
           } else {
-            // Snap to nearest edge (left or right)
             snapToEdge(currentParams)
           }
           true
@@ -281,6 +381,7 @@ class FloatingBubbleService : Service() {
       windowManager?.addView(container, windowParams)
       bubbleView = container
       isBubbleShowing = true
+      updateCoverArt(coverUrl)
     } catch (e: Exception) {
       Log.e("FloatingBubble", "Error adding bubble view: ${e.message}")
     }
@@ -288,11 +389,11 @@ class FloatingBubbleService : Service() {
 
   private fun snapToEdge(currentParams: WindowManager.LayoutParams) {
     val screenWidth = resources.displayMetrics.widthPixels
-    val bubbleWidth = bubbleView?.width ?: (58 * resources.displayMetrics.density).toInt()
+    val bubbleWidth = bubbleView?.width ?: (240 * resources.displayMetrics.density).toInt()
     val targetX = if (currentParams.x + bubbleWidth / 2 < screenWidth / 2) {
       12 // Snap to left edge
     } else {
-      screenWidth - bubbleWidth - 12 // Snap to right edge
+      (screenWidth - bubbleWidth - 12).coerceAtLeast(12) // Snap to right edge
     }
     currentParams.x = targetX
     try {
@@ -300,16 +401,56 @@ class FloatingBubbleService : Service() {
     } catch (_: Exception) {}
   }
 
-  private fun updateBubbleState(title: String, isPlaying: Boolean) {
-    val container = bubbleView as? FrameLayout ?: return
-    val indicator = container.getChildAt(1) ?: return
+  private fun updateBubbleState(title: String, isPlaying: Boolean, coverUrl: String?) {
+    titleTextView?.text = title
+    playPauseBtnView?.setImageResource(
+        if (isPlaying) R.drawable.ic_notif_pause else R.drawable.ic_notif_play
+    )
     val density = resources.displayMetrics.density
-    val dotDrawable = GradientDrawable().apply {
+    indicatorView?.background = GradientDrawable().apply {
       shape = GradientDrawable.OVAL
       setColor(if (isPlaying) Color.parseColor("#1ED760") else Color.parseColor("#9CA3AF"))
       setStroke((1 * density).toInt(), Color.WHITE)
     }
-    indicator.background = dotDrawable
+    updateCoverArt(coverUrl)
+  }
+
+  private fun updateCoverArt(coverUrl: String?) {
+    if (coverUrl.isNullOrEmpty()) {
+      currentCoverUrl = null
+      currentCoverBitmap = null
+      coverImageView?.setImageResource(R.drawable.soundwave_icon_1793581483680)
+      return
+    }
+
+    if (coverUrl == currentCoverUrl && currentCoverBitmap != null) {
+      coverImageView?.setImageBitmap(currentCoverBitmap)
+      return
+    }
+
+    currentCoverUrl = coverUrl
+    val cached = CoverLoader.getCached(coverUrl)
+    if (cached != null) {
+      currentCoverBitmap = cached
+      coverImageView?.setImageBitmap(cached)
+      return
+    }
+
+    // Load asynchronously via CoverLoader
+    val target = coverUrl
+    serviceScope.launch {
+      val bmp = CoverLoader.loadBitmap(this@FloatingBubbleService, target)
+      withContext(Dispatchers.Main) {
+        if (currentCoverUrl == target) {
+          currentCoverBitmap = bmp
+          if (bmp != null) {
+            coverImageView?.setImageBitmap(bmp)
+          } else {
+            coverImageView?.setImageResource(R.drawable.soundwave_icon_1793581483680)
+          }
+        }
+      }
+    }
   }
 
   private fun openAppFromBubble() {
@@ -348,6 +489,7 @@ class FloatingBubbleService : Service() {
   }
 
   override fun onDestroy() {
+    serviceScope.cancel()
     removeBubbleView()
     super.onDestroy()
   }

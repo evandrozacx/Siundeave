@@ -69,12 +69,14 @@ class MainActivity : ComponentActivity() {
     when (focusChange) {
       android.media.AudioManager.AUDIOFOCUS_LOSS -> {
         resumeOnFocusGain = false
-        runOnUiThread {
-          pauseNativePlaybackInternal()
+        if (torrentBridge.isNativeAudioPlaying()) {
+          runOnUiThread {
+            pauseNativePlaybackInternal()
+          }
         }
       }
       android.media.AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
-        if (isAudioPlaying || torrentBridge.isNativeAudioPlaying()) {
+        if (torrentBridge.isNativeAudioPlaying()) {
           resumeOnFocusGain = true
           runOnUiThread {
             pauseNativePlaybackInternal()
@@ -146,8 +148,12 @@ class MainActivity : ComponentActivity() {
 
   private fun pauseNativePlaybackInternal() {
     try {
-      torrentBridge.pauseAudioNative()
-      webView?.evaluateJavascript("if (typeof AppState !== 'undefined') { AppState.isPlaying = false; if (typeof updatePlayIcons === 'function') updatePlayIcons(false); }", null)
+      if (torrentBridge.isNativeAudioPlaying()) {
+        torrentBridge.pauseAudioNative()
+        webView?.evaluateJavascript(
+            "if (typeof activeAudioMode !== 'undefined' && activeAudioMode === 'native' && typeof AppState !== 'undefined') { AppState.isPlaying = false; if (typeof updatePlayIcons === 'function') updatePlayIcons(false); }",
+            null)
+      }
     } catch (e: Exception) {
       Log.w("SoundWave", "Error pausing playback on focus loss: ${e.message}")
     }
@@ -157,7 +163,9 @@ class MainActivity : ComponentActivity() {
     try {
       if (requestAudioFocus()) {
         torrentBridge.resumeAudioNative()
-        webView?.evaluateJavascript("if (typeof AppState !== 'undefined') { AppState.isPlaying = true; if (typeof updatePlayIcons === 'function') updatePlayIcons(true); }", null)
+        webView?.evaluateJavascript(
+            "if (typeof activeAudioMode !== 'undefined' && activeAudioMode === 'native' && typeof AppState !== 'undefined') { AppState.isPlaying = true; if (typeof updatePlayIcons === 'function') updatePlayIcons(true); }",
+            null)
       }
     } catch (e: Exception) {
       Log.w("SoundWave", "Error resuming playback on focus gain: ${e.message}")
@@ -170,6 +178,53 @@ class MainActivity : ComponentActivity() {
           .readTimeout(30, TimeUnit.SECONDS)
           .followRedirects(true)
           .build()
+
+  fun pruneAudioStreamCache(maxItems: Int = 30) {
+    try {
+      val audioFiles = cacheDir.listFiles { _, name ->
+        name.startsWith("audio_full_")
+      }?.sortedBy { it.lastModified() } ?: return
+      if (audioFiles.size > maxItems) {
+        val toDelete = audioFiles.take(audioFiles.size - maxItems)
+        for (file in toDelete) {
+          file.delete()
+        }
+      }
+    } catch (e: Exception) {
+      Log.w("SoundWave", "Error pruning audio cache: ${e.message}")
+    }
+  }
+
+  fun cacheStreamAudioInBackground(url: String, targetFile: File) {
+    if (url.startsWith("magnet:") || url.contains("soundwave.app/yt_embed")) return
+    lifecycleScope.launch(Dispatchers.IO) {
+      try {
+        if (targetFile.exists() && targetFile.length() > 50000) return@launch
+        val tempFile = File(cacheDir, targetFile.name + ".tmp")
+        val req = Request.Builder()
+            .url(url)
+            .header("User-Agent", "Mozilla/5.0 (Linux; Android 14) SoundWave/2.0")
+            .build()
+        okHttpClient.newCall(req).execute().use { resp ->
+          if (resp.isSuccessful) {
+            val body = resp.body ?: return@launch
+            FileOutputStream(tempFile).use { out ->
+              body.byteStream().copyTo(out)
+            }
+            if (tempFile.exists() && tempFile.length() > 30000) {
+              tempFile.renameTo(targetFile)
+              targetFile.setLastModified(System.currentTimeMillis())
+              pruneAudioStreamCache(30)
+            } else {
+              tempFile.delete()
+            }
+          }
+        }
+      } catch (_: Exception) {
+        // Background stream caching is non-fatal
+      }
+    }
+  }
 
   private val notificationPermissionLauncher =
       registerForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted ->
@@ -818,6 +873,82 @@ class MainActivity : ComponentActivity() {
     }
   }
 
+  private fun monitorDownloadProgress(downloadId: Long, fileName: String, manager: DownloadManager) {
+    lifecycleScope.launch(Dispatchers.IO) {
+      var isDownloading = true
+      var lastReportedPercent = -1
+
+      while (isDownloading && isActive) {
+        try {
+          val query = DownloadManager.Query().setFilterById(downloadId)
+          val cursor = manager.query(query)
+          if (cursor != null && cursor.moveToFirst()) {
+            val bytesCol = cursor.getColumnIndex(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR)
+            val totalCol = cursor.getColumnIndex(DownloadManager.COLUMN_TOTAL_SIZE_BYTES)
+            val statusCol = cursor.getColumnIndex(DownloadManager.COLUMN_STATUS)
+            val reasonCol = cursor.getColumnIndex(DownloadManager.COLUMN_REASON)
+
+            val bytesDownloaded = if (bytesCol != -1) cursor.getLong(bytesCol) else 0L
+            val totalBytes = if (totalCol != -1) cursor.getLong(totalCol) else 0L
+            val status = if (statusCol != -1) cursor.getInt(statusCol) else -1
+            val reason = if (reasonCol != -1) cursor.getInt(reasonCol) else 0
+
+            cursor.close()
+
+            when (status) {
+              DownloadManager.STATUS_RUNNING -> {
+                if (totalBytes > 0) {
+                  val percent = ((bytesDownloaded * 100) / totalBytes).toInt().coerceIn(0, 100)
+                  if (percent != lastReportedPercent && (percent - lastReportedPercent >= 10 || percent == 100)) {
+                    lastReportedPercent = percent
+                    withContext(Dispatchers.Main) {
+                      val qName = JSONObject.quote(fileName)
+                      webView?.evaluateJavascript(
+                          "if (window.onNativeDownloadProgress) { window.onNativeDownloadProgress($downloadId, $qName, $percent); }",
+                          null
+                      )
+                    }
+                  }
+                }
+              }
+              DownloadManager.STATUS_SUCCESSFUL -> {
+                isDownloading = false
+                withContext(Dispatchers.Main) {
+                  val qName = JSONObject.quote(fileName)
+                  Toast.makeText(this@MainActivity, "✅ Download concluído: $fileName (em Download/SoundWave)", Toast.LENGTH_SHORT).show()
+                  webView?.evaluateJavascript(
+                      "if (window.onNativeDownloadComplete) { window.onNativeDownloadComplete($downloadId, $qName); }",
+                      null
+                  )
+                }
+              }
+              DownloadManager.STATUS_FAILED -> {
+                isDownloading = false
+                withContext(Dispatchers.Main) {
+                  val qName = JSONObject.quote(fileName)
+                  val errMsg = "Falha no download (código $reason)"
+                  val qErr = JSONObject.quote(errMsg)
+                  Toast.makeText(this@MainActivity, "❌ $errMsg: $fileName", Toast.LENGTH_LONG).show()
+                  webView?.evaluateJavascript(
+                      "if (window.onNativeDownloadError) { window.onNativeDownloadError($downloadId, $qName, $qErr); }",
+                      null
+                  )
+                }
+              }
+            }
+          } else {
+            cursor?.close()
+            isDownloading = false
+          }
+        } catch (e: Exception) {
+          Log.w("SoundWaveDownload", "Error querying download progress: ${e.message}")
+          isDownloading = false
+        }
+        delay(1200)
+      }
+    }
+  }
+
   inner class AndroidTorrentBridge {
 
     @JavascriptInterface
@@ -1054,6 +1185,767 @@ class MainActivity : ComponentActivity() {
       }
     }
 
+    @JavascriptInterface
+    fun fetchUrlNativeAsync(url: String, callbackId: String) {
+      lifecycleScope.launch(Dispatchers.IO) {
+        val bodyStr =
+            try {
+              if (!url.startsWith("https://") && !url.startsWith("http://")) {
+                ""
+              } else {
+                val req =
+                    Request.Builder()
+                        .url(url)
+                        .header("User-Agent", "Mozilla/5.0 (Linux; Android 14) SoundWave/2.0")
+                        .header("Accept", "application/json, text/plain, */*")
+                        .build()
+                okHttpClient.newCall(req).execute().use { resp ->
+                  if (resp.isSuccessful) {
+                    resp.body?.string() ?: ""
+                  } else {
+                    ""
+                  }
+                }
+              }
+            } catch (e: Exception) {
+              Log.w("SoundWaveBridge", "fetchUrlNativeAsync error ($url): ${e.message}")
+              ""
+            }
+
+        withContext(Dispatchers.Main) {
+          val quotedBody = JSONObject.quote(bodyStr)
+          val quotedCb = JSONObject.quote(callbackId)
+          webView?.evaluateJavascript(
+              "if (window.onNativeUrlFetched) { window.onNativeUrlFetched($quotedCb, $quotedBody); }",
+              null)
+        }
+      }
+    }
+
+    private fun parseIso8601DurationToSeconds(iso: String?): Int {
+      if (iso.isNullOrEmpty()) return 0
+      val regex = Regex("PT(?:(\\d+)H)?(?:(\\d+)M)?(?:(\\d+)S)?", RegexOption.IGNORE_CASE)
+      val match = regex.find(iso) ?: return 0
+      val hours = match.groupValues.getOrNull(1)?.toIntOrNull() ?: 0
+      val minutes = match.groupValues.getOrNull(2)?.toIntOrNull() ?: 0
+      val seconds = match.groupValues.getOrNull(3)?.toIntOrNull() ?: 0
+      return (hours * 3600) + (minutes * 60) + seconds
+    }
+
+    private fun parseHumanDurationToSeconds(text: String?): Int {
+      if (text.isNullOrEmpty()) return 0
+      val parts = text.trim().split(":").mapNotNull { it.trim().toIntOrNull() }
+      return when (parts.size) {
+        2 -> (parts[0] * 60) + parts[1]
+        3 -> (parts[0] * 3600) + (parts[1] * 60) + parts[2]
+        else -> 0
+      }
+    }
+
+    private fun isOfficialMusicChannelOrRelease(channelName: String, title: String, isVerifiedBadge: Boolean): Boolean {
+      val c = channelName.lowercase()
+      val t = title.lowercase()
+
+      // Descartar pessoas comuns, amadores, reacts, tutoriais e ruídos
+      val amateurKeywords = listOf(
+          "react", "reagindo", "como tocar", "aula de", "aula violao", "aula guitarra",
+          "karaoke", "playback", "status whatsapp", "status para whatsapp", "tipografia",
+          "slowed", "reverb", "bass boosted", "8d audio", "gameplay", "vlog",
+          "cover amador", "ao vivo no churrasco", "parodia", "churrasco", "trolagem",
+          "unboxing", "review", "resenha", "tutorial", "podcast", "corte de podcast", "cortes"
+      )
+      if (amateurKeywords.any { t.contains(it) || c.contains(it) }) {
+        return false
+      }
+
+      if (isVerifiedBadge) return true
+
+      // Padrões de canais oficiais e gravadoras
+      val officialChannelPatterns = listOf(
+          " - topic", "vevo", "oficial", "official", "gravadora", "records", "music",
+          "som livre", "warner music", "universal music", "sony music", "kondzilla",
+          "gr6 explode", "workshow", "audiomix", "love funk", "legenda funk",
+          "deckdisc", "mk music", "todah music", "bizzu", "sua musica", "radar records",
+          "spinnin", "ultra records", "sertanejo", "pagode", "funk"
+      )
+      if (officialChannelPatterns.any { c.contains(it) }) return true
+
+      // Padrões de títulos oficiais de lançamentos
+      val officialTitlePatterns = listOf(
+          "clipe oficial", "vídeo oficial", "video oficial", "áudio oficial", "audio oficial",
+          "official music video", "official video", "official audio", "visualizer oficial",
+          "lyric video oficial", "ao vivo oficial", "dvd oficial", "single oficial",
+          "oficial video", "official lyric video"
+      )
+      if (officialTitlePatterns.any { t.contains(it) }) return true
+
+      return false
+    }
+
+    private fun extractVideoRenderersFromJson(
+        node: Any?,
+        outList: MutableList<JSONObject>,
+        seenIds: MutableSet<String>,
+        onlyOfficial: Boolean = false,
+        depth: Int = 0
+    ) {
+      if (node == null || outList.size >= 24 || depth > 20) return
+      when (node) {
+        is JSONObject -> {
+          if (node.has("videoRenderer")) {
+            val vr = node.optJSONObject("videoRenderer")
+            val videoId = vr?.optString("videoId") ?: ""
+            if (videoId.length == 11 && !seenIds.contains(videoId)) {
+              val titleRuns = vr?.optJSONObject("title")?.optJSONArray("runs")
+              val rawTitle =
+                  if (titleRuns != null && titleRuns.length() > 0) {
+                    titleRuns.optJSONObject(0)?.optString("text") ?: ""
+                  } else {
+                    vr?.optJSONObject("title")?.optString("simpleText") ?: ""
+                  }
+              if (rawTitle.isNotEmpty()) {
+                val ownerRuns =
+                    vr?.optJSONObject("ownerText")?.optJSONArray("runs")
+                        ?: vr?.optJSONObject("longBylineText")?.optJSONArray("runs")
+                        ?: vr?.optJSONObject("shortBylineText")?.optJSONArray("runs")
+                val channelName =
+                    if (ownerRuns != null && ownerRuns.length() > 0) {
+                      ownerRuns.optJSONObject(0)?.optString("text") ?: "Canal YouTube"
+                    } else {
+                      "Canal YouTube"
+                    }
+
+                val ownerBadges = vr?.optJSONArray("ownerBadges")
+                var isVerified = false
+                if (ownerBadges != null) {
+                  for (b in 0 until ownerBadges.length()) {
+                    val bObj = ownerBadges.optJSONObject(b)?.optJSONObject("metadataBadgeRenderer")
+                    val style = bObj?.optString("style") ?: ""
+                    val tooltip = bObj?.optString("tooltip") ?: ""
+                    if (style.contains("VERIFIED") || style.contains("ARTIST") ||
+                        tooltip.contains("Oficial", ignoreCase = true) ||
+                        tooltip.contains("Official", ignoreCase = true) ||
+                        tooltip.contains("Verificado", ignoreCase = true)) {
+                      isVerified = true
+                      break
+                    }
+                  }
+                }
+
+                val isOfficial = isOfficialMusicChannelOrRelease(channelName, rawTitle, isVerified)
+                if (!onlyOfficial || isOfficial) {
+                  val lengthStr =
+                      vr?.optJSONObject("lengthText")?.optString("simpleText")
+                          ?: vr?.optJSONObject("lengthText")?.optJSONArray("runs")?.optJSONObject(0)?.optString("text")
+                          ?: ""
+                  val durSecs = parseHumanDurationToSeconds(lengthStr)
+                  val thumbUrl = "https://i.ytimg.com/vi/$videoId/hqdefault.jpg"
+
+                  val publishedTimeStr =
+                      vr?.optJSONObject("publishedTimeText")?.optString("simpleText")
+                          ?: vr?.optJSONObject("publishedTimeText")?.optJSONArray("runs")?.optJSONObject(0)?.optString("text")
+                          ?: ""
+                  val pubLower = publishedTimeStr.lowercase()
+                  val isUnder24h = pubLower.isNotEmpty() &&
+                      (pubLower.contains("hora") || pubLower.contains("hour") ||
+                          pubLower.contains("minuto") || pubLower.contains("minute") ||
+                          pubLower.contains("segundo") || pubLower.contains("second") ||
+                          pubLower.contains("agora") || pubLower.contains("just now")) &&
+                      !pubLower.contains("dia") && !pubLower.contains("day") &&
+                      !pubLower.contains("semana") && !pubLower.contains("week") &&
+                      !pubLower.contains("mês") && !pubLower.contains("mes") && !pubLower.contains("month") &&
+                      !pubLower.contains("ano") && !pubLower.contains("year")
+
+                  val numMatch = Regex("(\\d+)").find(pubLower)?.groupValues?.getOrNull(1)?.toLongOrNull() ?: 1L
+                  val approxAgeMs = when {
+                    pubLower.contains("segundo") || pubLower.contains("second") -> numMatch * 1000L
+                    pubLower.contains("minuto") || pubLower.contains("minute") -> numMatch * 60_000L
+                    pubLower.contains("hora") || pubLower.contains("hour") -> numMatch * 3_600_000L
+                    pubLower.contains("dia") || pubLower.contains("day") -> numMatch * 86_400_000L
+                    else -> if (isUnder24h) 3_600_000L else 3 * 86_400_000L
+                  }
+                  val approxIso = java.time.Instant.ofEpochMilli(System.currentTimeMillis() - approxAgeMs).toString()
+
+                  seenIds.add(videoId)
+                  outList.add(
+                      JSONObject().apply {
+                        put("videoId", videoId)
+                        put("title", rawTitle)
+                        put("channelTitle", channelName)
+                        put("thumbnailUrl", thumbUrl)
+                        put("duration", durSecs)
+                        put("durationText", lengthStr)
+                        put("publishedTimeText", publishedTimeStr)
+                        put("publishedAt", approxIso)
+                        put("isNew24h", isUnder24h)
+                        put("isOfficial", isOfficial)
+                        put("isVerified", isVerified)
+                        put("source", if (isOfficial) "YouTube Oficial" else "YouTube")
+                      })
+                }
+              }
+            }
+          }
+          val keys = node.keys()
+          while (keys.hasNext() && outList.size < 24) {
+            val k = keys.next()
+            extractVideoRenderersFromJson(node.opt(k), outList, seenIds, onlyOfficial, depth + 1)
+          }
+        }
+        is org.json.JSONArray -> {
+          for (i in 0 until node.length()) {
+            if (outList.size >= 24) break
+            extractVideoRenderersFromJson(node.opt(i), outList, seenIds, onlyOfficial, depth + 1)
+          }
+        }
+      }
+    }
+
+    @JavascriptInterface
+    fun searchYouTubeVideosAsync(query: String, callbackId: String) {
+      lifecycleScope.launch(Dispatchers.IO) {
+        val resultsArray = org.json.JSONArray()
+        val seenVideoIds = mutableSetOf<String>()
+        val cleanQuery = query.trim()
+
+        if (cleanQuery.length >= 2) {
+          val encoded = try { URLEncoder.encode(cleanQuery, "UTF-8") } catch (_: Exception) { "" }
+          val apiKey = try { BuildConfig.YOUTUBE_API_KEY.trim() } catch (_: Exception) { "" }
+
+          // 1. Primary: Official YouTube Data API v3 (when YOUTUBE_API_KEY is configured in AI Studio Secrets)
+          if (encoded.isNotEmpty() &&
+              apiKey.isNotEmpty() &&
+              apiKey != "MY_YOUTUBE_API_KEY" &&
+              !apiKey.startsWith("YOUR_")) {
+            try {
+              val searchUrl =
+                  "https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoEmbeddable=true&order=relevance&maxResults=22&q=$encoded&key=$apiKey"
+              val req =
+                  Request.Builder()
+                      .url(searchUrl)
+                      .header("User-Agent", "Mozilla/5.0 (Linux; Android 14) SoundWave/2.0")
+                      .header("Accept", "application/json")
+                      .build()
+
+              val tempItems = mutableListOf<JSONObject>()
+              val idList = mutableListOf<String>()
+
+              okHttpClient.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) {
+                  val bodyStr = resp.body?.string() ?: ""
+                  val json = JSONObject(bodyStr)
+                  val items = json.optJSONArray("items")
+                  if (items != null) {
+                    for (i in 0 until items.length()) {
+                      val item = items.optJSONObject(i) ?: continue
+                      val idObj = item.optJSONObject("id")
+                      val videoId = idObj?.optString("videoId") ?: ""
+                      val snippet = item.optJSONObject("snippet") ?: continue
+                      if (videoId.isNotEmpty() && !seenVideoIds.contains(videoId)) {
+                        seenVideoIds.add(videoId)
+                        idList.add(videoId)
+                        val title =
+                            android.text.Html.fromHtml(
+                                    snippet.optString("title", "Vídeo Musical"),
+                                    android.text.Html.FROM_HTML_MODE_LEGACY)
+                                .toString()
+                        val channelTitle = snippet.optString("channelTitle", "YouTube")
+                        val thumbs = snippet.optJSONObject("thumbnails")
+                        val thumbUrl =
+                            thumbs?.optJSONObject("high")?.optString("url")
+                                ?: thumbs?.optJSONObject("medium")?.optString("url")
+                                ?: "https://i.ytimg.com/vi/$videoId/hqdefault.jpg"
+
+                        tempItems.add(
+                            JSONObject().apply {
+                              put("videoId", videoId)
+                              put("title", title)
+                              put("channelTitle", channelTitle)
+                              put("thumbnailUrl", thumbUrl)
+                              put("duration", 0)
+                              put("source", "YouTube Data API v3")
+                            })
+                      }
+                    }
+                  }
+                }
+              }
+
+              // Fetch exact video durations from YouTube Data API v3 videos.list endpoint
+              if (idList.isNotEmpty()) {
+                val durationMap = mutableMapOf<String, Int>()
+                try {
+                  val idsCsv = URLEncoder.encode(idList.joinToString(","), "UTF-8")
+                  val detailsUrl =
+                      "https://www.googleapis.com/youtube/v3/videos?part=contentDetails&id=$idsCsv&key=$apiKey"
+                  val detailsReq =
+                      Request.Builder()
+                          .url(detailsUrl)
+                          .header("User-Agent", "Mozilla/5.0 (Linux; Android 14) SoundWave/2.0")
+                          .build()
+                  okHttpClient.newCall(detailsReq).execute().use { dResp ->
+                    if (dResp.isSuccessful) {
+                      val dJson = JSONObject(dResp.body?.string() ?: "{}")
+                      val dItems = dJson.optJSONArray("items")
+                      if (dItems != null) {
+                        for (j in 0 until dItems.length()) {
+                          val dObj = dItems.optJSONObject(j) ?: continue
+                          val vId = dObj.optString("id")
+                          val isoDur =
+                              dObj.optJSONObject("contentDetails")?.optString("duration")
+                          val secs = parseIso8601DurationToSeconds(isoDur)
+                          if (vId.isNotEmpty() && secs > 0) {
+                            durationMap[vId] = secs
+                          }
+                        }
+                      }
+                    }
+                  }
+                } catch (e: Exception) {
+                  Log.w("SoundWaveYouTube", "Error fetching video durations: ${e.message}")
+                }
+
+                for (obj in tempItems) {
+                  val vId = obj.optString("videoId")
+                  if (durationMap.containsKey(vId)) {
+                    obj.put("duration", durationMap[vId] ?: 0)
+                  }
+                  resultsArray.put(obj)
+                }
+              }
+            } catch (e: Exception) {
+              Log.w("SoundWaveYouTube", "YouTube Data API v3 search error: ${e.message}")
+            }
+          }
+
+          // 2. Complementary Discovery Fallback (when YOUTUBE_API_KEY is not yet configured or quota exceeded)
+          if (resultsArray.length() == 0 && encoded.isNotEmpty()) {
+            try {
+              val ytSearchUrl = "https://www.youtube.com/results?search_query=$encoded&sp=EgIQAQ%253D%253D"
+              val req =
+                  Request.Builder()
+                      .url(ytSearchUrl)
+                      .header(
+                          "User-Agent",
+                          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+                      .header("Accept-Language", "pt-BR,pt;q=0.9,en-US;q=0.8")
+                      .build()
+              okHttpClient.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) {
+                  val html = resp.body?.string() ?: ""
+                  val marker = "var ytInitialData = "
+                  val startIdx = html.indexOf(marker)
+                  if (startIdx != -1) {
+                    val jsonStart = startIdx + marker.length
+                    val endIdx = html.indexOf(";</script>", jsonStart)
+                    if (endIdx != -1) {
+                      val rawJson = html.substring(jsonStart, endIdx).trim()
+                      val rootObj = JSONObject(rawJson)
+                      val extracted = mutableListOf<JSONObject>()
+                      extractVideoRenderersFromJson(rootObj, extracted, seenVideoIds)
+                      for (item in extracted) {
+                        resultsArray.put(item)
+                      }
+                    }
+                  }
+                }
+              }
+            } catch (e: Exception) {
+              Log.w("SoundWaveYouTube", "YouTube fallback discovery error: ${e.message}")
+            }
+          }
+        }
+
+        val jsonOut = resultsArray.toString()
+        withContext(Dispatchers.Main) {
+          val quotedBody = JSONObject.quote(jsonOut)
+          val quotedCb = JSONObject.quote(callbackId)
+          webView?.evaluateJavascript(
+              "if (window.onYouTubeSearchLoaded) { window.onYouTubeSearchLoaded($quotedCb, $quotedBody); }",
+              null)
+        }
+      }
+    }
+
+    @JavascriptInterface
+    fun fetchYouTubeDiscoverAsync(categoryQuery: String, publishedAfterIso: String, callbackId: String) {
+      lifecycleScope.launch(Dispatchers.IO) {
+        val resultsArray = org.json.JSONArray()
+        val seenVideoIds = mutableSetOf<String>()
+        val cleanQuery = categoryQuery.trim().ifEmpty { "musica lancamento brasil" }
+        val officialQuery = if (!cleanQuery.contains("oficial", ignoreCase = true) && !cleanQuery.contains("vevo", ignoreCase = true)) {
+          "\"Vídeo Oficial\" $cleanQuery"
+        } else {
+          cleanQuery
+        }
+        val encodedQuery = try { URLEncoder.encode(officialQuery, "UTF-8") } catch (_: Exception) { "" }
+        val encodedPub = try { URLEncoder.encode(publishedAfterIso.trim(), "UTF-8") } catch (_: Exception) { "" }
+        val apiKey = try { BuildConfig.YOUTUBE_API_KEY.trim() } catch (_: Exception) { "" }
+
+        val isInternationalQuery =
+            cleanQuery.contains("Official Music Video", ignoreCase = true) &&
+                cleanQuery.contains("-clipe", ignoreCase = true)
+        val regionParam = if (isInternationalQuery) "regionCode=US&relevanceLanguage=en" else "regionCode=BR&relevanceLanguage=pt"
+        val acceptLangHeader = if (isInternationalQuery) "en-US,en;q=0.9" else "pt-BR,pt;q=0.9,en-US;q=0.8"
+
+        if (encodedQuery.isNotEmpty() &&
+            apiKey.isNotEmpty() &&
+            apiKey != "MY_YOUTUBE_API_KEY" &&
+            !apiKey.startsWith("YOUR_")) {
+          try {
+            val pubParam = if (encodedPub.isNotEmpty()) "&publishedAfter=$encodedPub" else ""
+            val searchUrl =
+                "https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoCategoryId=10&videoEmbeddable=true&$regionParam&order=relevance&maxResults=25&q=$encodedQuery$pubParam&key=$apiKey"
+            val req =
+                Request.Builder()
+                    .url(searchUrl)
+                    .header("User-Agent", "Mozilla/5.0 (Linux; Android 14) SoundWave/2.0")
+                    .header("Accept", "application/json")
+                    .build()
+
+            val tempItems = mutableListOf<JSONObject>()
+            val idList = mutableListOf<String>()
+
+            okHttpClient.newCall(req).execute().use { resp ->
+              if (resp.isSuccessful) {
+                val bodyStr = resp.body?.string() ?: ""
+                val json = JSONObject(bodyStr)
+                val items = json.optJSONArray("items")
+                if (items != null) {
+                  for (i in 0 until items.length()) {
+                    val item = items.optJSONObject(i) ?: continue
+                    val idObj = item.optJSONObject("id")
+                    val videoId = idObj?.optString("videoId") ?: ""
+                    val snippet = item.optJSONObject("snippet") ?: continue
+                    if (videoId.isNotEmpty() && !seenVideoIds.contains(videoId)) {
+                      val title =
+                          android.text.Html.fromHtml(
+                                  snippet.optString("title", "Vídeo Musical"),
+                                  android.text.Html.FROM_HTML_MODE_LEGACY)
+                              .toString()
+                      val channelTitle = snippet.optString("channelTitle", "YouTube")
+                      
+                      // Filtrar estritamente canais oficiais / gravadoras / lançamentos legítimos
+                      val isOfficial = isOfficialMusicChannelOrRelease(channelTitle, title, false)
+                      if (!isOfficial) continue
+
+                      seenVideoIds.add(videoId)
+                      idList.add(videoId)
+                      val publishedAt = snippet.optString("publishedAt", "")
+                      val isNew24h = try {
+                        if (publishedAt.isNotEmpty()) {
+                          val pubMillis = java.time.Instant.parse(publishedAt).toEpochMilli()
+                          val diff = System.currentTimeMillis() - pubMillis
+                          diff in -3_600_000L..(24 * 3_600_000L)
+                        } else false
+                      } catch (_: Exception) {
+                        false
+                      }
+                      val thumbs = snippet.optJSONObject("thumbnails")
+                      val thumbUrl =
+                          thumbs?.optJSONObject("high")?.optString("url")
+                              ?: thumbs?.optJSONObject("medium")?.optString("url")
+                              ?: "https://i.ytimg.com/vi/$videoId/hqdefault.jpg"
+
+                      tempItems.add(
+                          JSONObject().apply {
+                            put("videoId", videoId)
+                            put("title", title)
+                            put("channelTitle", channelTitle)
+                            put("thumbnailUrl", thumbUrl)
+                            put("publishedAt", publishedAt)
+                            put("isNew24h", isNew24h)
+                            put("duration", 0)
+                            put("isOfficial", true)
+                            put("source", "YouTube Oficial")
+                          })
+                    }
+                  }
+                }
+              }
+            }
+
+            if (idList.isNotEmpty()) {
+              val durationMap = mutableMapOf<String, Int>()
+              try {
+                val idsCsv = URLEncoder.encode(idList.joinToString(","), "UTF-8")
+                val detailsUrl =
+                    "https://www.googleapis.com/youtube/v3/videos?part=contentDetails&id=$idsCsv&key=$apiKey"
+                val detailsReq =
+                    Request.Builder()
+                        .url(detailsUrl)
+                        .header("User-Agent", "Mozilla/5.0 (Linux; Android 14) SoundWave/2.0")
+                        .build()
+                okHttpClient.newCall(detailsReq).execute().use { dResp ->
+                  if (dResp.isSuccessful) {
+                    val dJson = JSONObject(dResp.body?.string() ?: "{}")
+                    val dItems = dJson.optJSONArray("items")
+                    if (dItems != null) {
+                      for (j in 0 until dItems.length()) {
+                        val dObj = dItems.optJSONObject(j) ?: continue
+                        val vId = dObj.optString("id")
+                        val isoDur = dObj.optJSONObject("contentDetails")?.optString("duration")
+                        val secs = parseIso8601DurationToSeconds(isoDur)
+                        if (vId.isNotEmpty() && secs > 0) {
+                          durationMap[vId] = secs
+                        }
+                      }
+                    }
+                  }
+                }
+              } catch (e: Exception) {
+                Log.w("SoundWaveDiscover", "Error fetching video durations: ${e.message}")
+              }
+
+              for (obj in tempItems) {
+                val vId = obj.optString("videoId")
+                if (durationMap.containsKey(vId)) {
+                  obj.put("duration", durationMap[vId] ?: 0)
+                }
+                resultsArray.put(obj)
+              }
+            }
+          } catch (e: Exception) {
+            Log.w("SoundWaveDiscover", "YouTube Data API v3 discover error: ${e.message}")
+          }
+        }
+
+        // Fallback recente: busca primeiro lançamentos das últimas 24h (sp=EgIIAg%253D%253D) + esta semana (sp=CAISAhAB)
+        if (resultsArray.length() == 0 && encodedQuery.isNotEmpty()) {
+          val spFilters = listOf("EgIIAg%253D%253D", "CAISAhAB")
+          for (spFilter in spFilters) {
+            if (resultsArray.length() >= 20) break
+            try {
+              val ytSearchUrl = "https://www.youtube.com/results?search_query=$encodedQuery&sp=$spFilter"
+              val req =
+                  Request.Builder()
+                      .url(ytSearchUrl)
+                      .header(
+                          "User-Agent",
+                          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+                      .header("Accept-Language", acceptLangHeader)
+                      .build()
+              okHttpClient.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) {
+                  val html = resp.body?.string() ?: ""
+                  val marker = "var ytInitialData = "
+                  val startIdx = html.indexOf(marker)
+                  if (startIdx != -1) {
+                    val jsonStart = startIdx + marker.length
+                    val endIdx = html.indexOf(";</script>", jsonStart)
+                    if (endIdx != -1) {
+                      val rawJson = html.substring(jsonStart, endIdx).trim()
+                      val rootObj = JSONObject(rawJson)
+                      val extracted = mutableListOf<JSONObject>()
+                      extractVideoRenderersFromJson(rootObj, extracted, seenVideoIds, onlyOfficial = true)
+                      for (item in extracted) {
+                        if (spFilter == "EgIIAg%253D%253D") {
+                          item.put("isNew24h", true)
+                        }
+                        resultsArray.put(item)
+                      }
+                    }
+                  }
+                }
+              }
+            } catch (e: Exception) {
+              Log.w("SoundWaveDiscover", "YouTube discover fallback error ($spFilter): ${e.message}")
+            }
+          }
+        }
+
+        val jsonOut = resultsArray.toString()
+        withContext(Dispatchers.Main) {
+          val quotedBody = JSONObject.quote(jsonOut)
+          val quotedCb = JSONObject.quote(callbackId)
+          webView?.evaluateJavascript(
+              "if (window.onYouTubeDiscoverLoaded) { window.onYouTubeDiscoverLoaded($quotedCb, $quotedBody); }",
+              null)
+        }
+      }
+    }
+
+    @JavascriptInterface
+    fun fetchOfficialChartsAndReleasesAsync(genreKey: String, callbackId: String) {
+      lifecycleScope.launch(Dispatchers.IO) {
+        val resultsArray = org.json.JSONArray()
+        val seenKeys = mutableSetOf<String>()
+
+        try {
+          val rssUrl = "https://rss.applemarketingtools.com/api/v2/br/music/most-played/50/songs.json"
+          val req = Request.Builder()
+              .url(rssUrl)
+              .header("User-Agent", "Mozilla/5.0 (Linux; Android 14) SoundWave/2.0")
+              .build()
+
+          okHttpClient.newCall(req).execute().use { resp ->
+            if (resp.isSuccessful) {
+              val body = resp.body?.string() ?: ""
+              val json = JSONObject(body)
+              val feed = json.optJSONObject("feed")
+              val results = feed?.optJSONArray("results")
+              if (results != null) {
+                for (i in 0 until results.length()) {
+                  val item = results.optJSONObject(i) ?: continue
+                  val id = item.optString("id")
+                  val name = item.optString("name")
+                  val artist = item.optString("artistName")
+                  val releaseDate = item.optString("releaseDate")
+                  val rawArt = item.optString("artworkUrl100")
+                  val coverArt = if (rawArt.isNotEmpty()) rawArt.replace("100x100bb", "600x600bb") else ""
+                  val genresArr = item.optJSONArray("genres")
+                  val genreName = genresArr?.optJSONObject(0)?.optString("name") ?: "Música"
+
+                  val dedup = "${artist.lowercase()}_${name.lowercase()}"
+                  if (name.isNotEmpty() && !seenKeys.contains(dedup)) {
+                    seenKeys.add(dedup)
+                    resultsArray.put(JSONObject().apply {
+                      put("id", "it_$id")
+                      put("title", name)
+                      put("artist", artist)
+                      put("album", "Lançamentos & Top Brasil")
+                      put("releaseDate", releaseDate)
+                      put("coverUrl", coverArt)
+                      put("genre", genreName)
+                      put("source", "Apple Music Brasil")
+                      put("rank", i + 1)
+                    })
+                  }
+                }
+              }
+            }
+          }
+        } catch (e: Exception) {
+          Log.w("SoundWaveDiscover", "Error fetching Apple RSS: ${e.message}")
+        }
+
+        if (resultsArray.length() < 12) {
+          try {
+            val q = if (genreKey.isNotEmpty() && genreKey != "brasil" && genreKey != "all") {
+              "lancamentos $genreKey"
+            } else {
+              "lancamentos brasil 2026"
+            }
+            val enc = URLEncoder.encode(q, "UTF-8")
+            val itunesUrl = "https://itunes.apple.com/search?term=$enc&entity=song&limit=30&country=BR"
+            val req = Request.Builder().url(itunesUrl).build()
+            okHttpClient.newCall(req).execute().use { resp ->
+              if (resp.isSuccessful) {
+                val json = JSONObject(resp.body?.string() ?: "{}")
+                val res = json.optJSONArray("results")
+                if (res != null) {
+                  for (i in 0 until res.length()) {
+                    val item = res.optJSONObject(i) ?: continue
+                    val tName = item.optString("trackName")
+                    val aName = item.optString("artistName")
+                    val cName = item.optString("collectionName")
+                    val rawDate = item.optString("releaseDate")
+                    val prevUrl = item.optString("previewUrl")
+                    val art = item.optString("artworkUrl100").replace("100x100bb", "600x600bb")
+                    val durSecs = (item.optLong("trackTimeMillis", 0) / 1000).toInt()
+
+                    val dedup = "${aName.lowercase()}_${tName.lowercase()}"
+                    if (tName.isNotEmpty() && !seenKeys.contains(dedup)) {
+                      seenKeys.add(dedup)
+                      resultsArray.put(JSONObject().apply {
+                        put("id", "it_${item.optString("trackId")}")
+                        put("title", tName)
+                        put("artist", aName)
+                        put("album", cName)
+                        put("releaseDate", if (rawDate.length >= 10) rawDate.substring(0, 10) else rawDate)
+                        put("coverUrl", art)
+                        put("previewUrl", prevUrl)
+                        put("duration", durSecs)
+                        put("genre", item.optString("primaryGenreName", "Geral"))
+                        put("source", "Apple iTunes")
+                      })
+                    }
+                  }
+                }
+              }
+            }
+          } catch (e: Exception) {
+            Log.w("SoundWaveDiscover", "Error fetching iTunes: ${e.message}")
+          }
+        }
+
+        val jsonOut = resultsArray.toString()
+        withContext(Dispatchers.Main) {
+          val quotedBody = JSONObject.quote(jsonOut)
+          val quotedCb = JSONObject.quote(callbackId)
+          webView?.evaluateJavascript(
+              "if (window.onOfficialDiscoverLoaded) { window.onOfficialDiscoverLoaded($quotedCb, $quotedBody); }",
+              null)
+        }
+      }
+    }
+
+    @JavascriptInterface
+    fun downloadAudioFileNative(url: String, suggestedName: String): Boolean {
+      if (!url.startsWith("http://") && !url.startsWith("https://")) return false
+      runOnUiThread {
+        try {
+          val cleanBase =
+              suggestedName
+                  .replace(Regex("[\\\\/:*?\"<>|]"), "_")
+                  .replace(Regex("\\s+"), " ")
+                  .trim()
+                  .ifEmpty { "SoundWave_Track" }
+          val ext =
+              when {
+                cleanBase.endsWith(".mp3", true) ||
+                    cleanBase.endsWith(".m4a", true) ||
+                    cleanBase.endsWith(".flac", true) ||
+                    cleanBase.endsWith(".ogg", true) ||
+                    cleanBase.endsWith(".wav", true) -> ""
+                url.contains(".flac", true) -> ".flac"
+                url.contains(".m4a", true) -> ".m4a"
+                url.contains(".ogg", true) -> ".ogg"
+                else -> ".mp3"
+              }
+          val finalFileName = "$cleanBase$ext"
+          val mimeType =
+              when {
+                finalFileName.endsWith(".flac", true) -> "audio/flac"
+                finalFileName.endsWith(".m4a", true) -> "audio/mp4"
+                finalFileName.endsWith(".ogg", true) -> "audio/ogg"
+                else -> "audio/mpeg"
+              }
+
+          val soundWaveSubDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "SoundWave")
+          if (!soundWaveSubDir.exists()) {
+            soundWaveSubDir.mkdirs()
+          }
+
+          val request =
+              DownloadManager.Request(Uri.parse(url)).apply {
+                setMimeType(mimeType)
+                addRequestHeader("User-Agent", "Mozilla/5.0 (Linux; Android 14) SoundWave/2.0")
+                setDescription("Baixando música via SoundWave")
+                setTitle(finalFileName)
+                setNotificationVisibility(
+                    DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, "SoundWave/$finalFileName")
+              }
+          val manager = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+          val downloadId = manager.enqueue(request)
+          Toast.makeText(this@MainActivity, "⬇️ Download iniciado em Download/SoundWave: $finalFileName", Toast.LENGTH_SHORT).show()
+
+          val quotedName = JSONObject.quote(finalFileName)
+          val quotedUrl = JSONObject.quote(url)
+          webView?.evaluateJavascript(
+              "if (window.onNativeDownloadRegistered) { window.onNativeDownloadRegistered($quotedName, $quotedUrl); }",
+              null)
+
+          monitorDownloadProgress(downloadId, finalFileName, manager)
+        } catch (e: Exception) {
+          Log.w("SoundWaveDownload", "Error downloading audio: ${e.message}")
+          Toast.makeText(this@MainActivity, "Erro ao iniciar download: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
+      }
+      return true
+    }
+
     private var mediaPlayer: android.media.MediaPlayer? = null
     private var currentPfd: android.os.ParcelFileDescriptor? = null
     private var progressJob: kotlinx.coroutines.Job? = null
@@ -1101,6 +1993,7 @@ class MainActivity : ComponentActivity() {
 
     @JavascriptInterface
     fun playAudioNative(url: String): Boolean {
+      if (url.startsWith("magnet:")) return false
       playAudioJob?.cancel()
       playAudioJob = lifecycleScope.launch(Dispatchers.IO) {
         withContext(Dispatchers.Main) {
@@ -1112,6 +2005,7 @@ class MainActivity : ComponentActivity() {
         val uri = Uri.parse(url)
         var pfdToUse: android.os.ParcelFileDescriptor? = null
         var localPath: String? = null
+        var resolvedStreamUrl: String = url
 
         try {
           if (url.startsWith("content://")) {
@@ -1122,48 +2016,68 @@ class MainActivity : ComponentActivity() {
             }
           } else if (url.startsWith("http://") || url.startsWith("https://")) {
             val hash = Math.abs(url.hashCode())
-            val ext = if (url.contains(".m4a")) ".m4a" else ".mp3"
+            val ext = if (url.contains(".m4a", true)) ".m4a" else ".mp3"
             val cacheFile = File(cacheDir, "audio_full_$hash$ext")
-            
-            var downloadSuccess = false
-            if (cacheFile.exists() && cacheFile.length() > 50000) { // Assume min 50KB for valid audio
-              downloadSuccess = true
-            } else {
-              try {
-                val req = Request.Builder()
-                    .url(url)
-                    .header("User-Agent", "Mozilla/5.0 (Linux; Android 14) SoundWave/1.0")
-                    .build()
-                val resp = okHttpClient.newCall(req).execute()
-                if (resp.isSuccessful) {
-                  resp.body?.byteStream()?.use { input ->
-                    FileOutputStream(cacheFile).use { output -> 
-                      input.copyTo(output) 
-                    }
-                  }
-                  if (cacheFile.exists() && cacheFile.length() > 0) {
-                    downloadSuccess = true
-                  }
-                }
-                resp.close()
-              } catch (e: Exception) {
-                Log.w("SoundWave", "Cache download failed for $url: ${e.message}")
-                if (cacheFile.exists()) cacheFile.delete()
-              }
-            }
-            
-            if (downloadSuccess) {
+
+            if (cacheFile.exists() && cacheFile.length() > 30000) {
+              cacheFile.setLastModified(System.currentTimeMillis())
               localPath = cacheFile.absolutePath
             } else {
-              // Fallback to direct streaming if cache fails
-              localPath = null
+              // Fast check: for short previews (< 2.5MB) cache synchronously; for full tracks stream immediately and resolve redirects
+              val isLikelyPreview =
+                  url.contains("itunes.apple.com", true) ||
+                      url.contains("dzcdn.net", true) ||
+                      url.contains("cdns-preview", true)
+              if (isLikelyPreview) {
+                try {
+                  val req =
+                      Request.Builder()
+                          .url(url)
+                          .header("User-Agent", "Mozilla/5.0 (Linux; Android 14) SoundWave/2.0")
+                          .build()
+                  okHttpClient.newCall(req).execute().use { resp ->
+                    resolvedStreamUrl = resp.request.url.toString()
+                    val contentLength = resp.body?.contentLength() ?: -1L
+                    if (resp.isSuccessful && contentLength in 1..2800000L) {
+                      resp.body?.byteStream()?.use { input ->
+                        FileOutputStream(cacheFile).use { output -> input.copyTo(output) }
+                      }
+                      if (cacheFile.exists() && cacheFile.length() > 30000) {
+                        cacheFile.setLastModified(System.currentTimeMillis())
+                        pruneAudioStreamCache(30)
+                        localPath = cacheFile.absolutePath
+                      }
+                    }
+                  }
+                } catch (e: Exception) {
+                  Log.w("SoundWave", "Preview cache download failed for $url: ${e.message}")
+                  if (cacheFile.exists()) cacheFile.delete()
+                }
+              } else {
+                // For full-length streams (Internet Archive, Audius, Open Audio), resolve redirect URL quickly without downloading entire file first
+                try {
+                  val headReq =
+                      Request.Builder()
+                          .url(url)
+                          .header("User-Agent", "Mozilla/5.0 (Linux; Android 14) SoundWave/2.0")
+                          .header("Range", "bytes=0-1")
+                          .build()
+                  okHttpClient.newCall(headReq).execute().use { resp ->
+                    resolvedStreamUrl = resp.request.url.toString()
+                  }
+                  cacheStreamAudioInBackground(resolvedStreamUrl, cacheFile)
+                } catch (_: Exception) {
+                  resolvedStreamUrl = url
+                  if (cacheFile.exists() && cacheFile.length() > 30000) {
+                    localPath = cacheFile.absolutePath
+                  }
+                }
+              }
             }
           } else {
             val file = File(url)
             if (file.exists()) {
               localPath = url
-            } else {
-              localPath = null
             }
           }
         } catch (e: Exception) {
@@ -1198,9 +2112,8 @@ class MainActivity : ComponentActivity() {
               } else if (!localPath.isNullOrEmpty()) {
                 player.setDataSource(localPath)
               } else {
-                // If localPath is null and it's a web URL, use the URL directly for streaming
-                if (url.startsWith("http")) {
-                  player.setDataSource(url)
+                if (resolvedStreamUrl.startsWith("http")) {
+                  player.setDataSource(resolvedStreamUrl)
                 } else {
                   player.setDataSource(applicationContext, uri)
                 }
@@ -1387,7 +2300,12 @@ class MainActivity : ComponentActivity() {
             posMs
         )
         if (FloatingBubbleService.isBubbleShowing) {
-          FloatingBubbleService.update(this@MainActivity, currentTrackTitle, isPlaying)
+          FloatingBubbleService.update(
+              this@MainActivity,
+              currentTrackTitle,
+              isPlaying,
+              coverUrl.ifEmpty { null }
+          )
         }
       }
     }
@@ -1423,7 +2341,12 @@ class MainActivity : ComponentActivity() {
             }
           } else {
             Toast.makeText(this@MainActivity, "Balão flutuante ativo!", Toast.LENGTH_SHORT).show()
-            FloatingBubbleService.show(this@MainActivity, currentTrackTitle, isAudioPlaying)
+            FloatingBubbleService.show(
+                this@MainActivity,
+                currentTrackTitle,
+                isAudioPlaying,
+                currentCoverUrl.ifEmpty { null }
+            )
           }
         }
       }
@@ -1465,6 +2388,121 @@ class MainActivity : ComponentActivity() {
       val prefs = getSharedPreferences("soundwave_prefs", Context.MODE_PRIVATE)
       return prefs.getBoolean("floating_bubble_enabled", true)
     }
+    @JavascriptInterface
+    fun minimizeAppToBackground() {
+      runOnUiThread {
+        moveTaskToBack(true)
+      }
+    }
+
+    @JavascriptInterface
+    fun checkForAppUpdateAsync(callbackId: String, customRepo: String? = null) {
+      lifecycleScope.launch(Dispatchers.IO) {
+        try {
+          val updateInfo = AppUpdateManager.checkForUpdate(this@MainActivity, customRepo)
+          val json = org.json.JSONObject().apply {
+            put("hasUpdate", updateInfo.hasUpdate)
+            put("currentVersionName", updateInfo.currentVersionName)
+            put("currentVersionCode", updateInfo.currentVersionCode)
+            put("latestVersionName", updateInfo.latestVersionName)
+            put("latestVersionCode", updateInfo.latestVersionCode)
+            put("downloadUrl", updateInfo.downloadUrl)
+            put("changelog", updateInfo.changelog)
+            put("releaseName", updateInfo.releaseName)
+            put("publishedAt", updateInfo.publishedAt)
+            put("repoName", updateInfo.repoName)
+          }
+          val jsonString = json.toString().replace("\\", "\\\\").replace("'", "\\'")
+          runOnUiThread {
+            webView?.evaluateJavascript(
+                "if (window._updateCallbacks && window._updateCallbacks['$callbackId']) { window._updateCallbacks['$callbackId']('$jsonString'); }",
+                null
+            )
+          }
+        } catch (e: Exception) {
+          Log.w("MainActivity", "Error in checkForAppUpdateAsync: ${e.message}")
+          val fallbackJson = org.json.JSONObject().apply {
+            put("hasUpdate", false)
+            put("error", e.message ?: "Falha ao verificar atualização")
+          }.toString().replace("\\", "\\\\").replace("'", "\\'")
+          runOnUiThread {
+            webView?.evaluateJavascript(
+                "if (window._updateCallbacks && window._updateCallbacks['$callbackId']) { window._updateCallbacks['$callbackId']('$fallbackJson'); }",
+                null
+            )
+          }
+        }
+      }
+    }
+
+    @JavascriptInterface
+    fun startAppUpdateDownload(apkUrl: String) {
+      lifecycleScope.launch(Dispatchers.IO) {
+        AppUpdateManager.downloadAndInstall(
+            this@MainActivity,
+            apkUrl,
+            onProgress = { percent ->
+              runOnUiThread {
+                webView?.evaluateJavascript(
+                    "if (typeof window.onUpdateDownloadProgress === 'function') { window.onUpdateDownloadProgress($percent); }",
+                    null
+                )
+              }
+            },
+            onSuccess = {
+              runOnUiThread {
+                webView?.evaluateJavascript(
+                    "if (typeof window.onUpdateDownloadComplete === 'function') { window.onUpdateDownloadComplete(); }",
+                    null
+                )
+              }
+            },
+            onError = { errMsg ->
+              val escaped = errMsg.replace("'", "\\'")
+              runOnUiThread {
+                webView?.evaluateJavascript(
+                    "if (typeof window.onUpdateDownloadError === 'function') { window.onUpdateDownloadError('$escaped'); }",
+                    null
+                )
+              }
+            }
+        )
+      }
+    }
+
+    @JavascriptInterface
+    fun getAppVersionInfo(): String {
+      val repo = AppUpdateManager.getGitHubRepo(this@MainActivity)
+      return org.json.JSONObject().apply {
+        put("versionName", BuildConfig.VERSION_NAME)
+        put("versionCode", BuildConfig.VERSION_CODE)
+        put("githubRepo", repo)
+      }.toString()
+    }
+
+    @JavascriptInterface
+    fun setGitHubUpdateRepo(repo: String): Boolean {
+      AppUpdateManager.setGitHubRepo(this@MainActivity, repo)
+      return true
+    }
+  }
+
+  /**
+   * Custom WebView that keeps Chromium media decoders and JS timers active in the background
+   * when the user minimizes the app while listening to YouTube streams or HTML5 audio.
+   */
+  private inner class BackgroundAudioWebView(context: Context) : WebView(context) {
+    override fun onWindowVisibilityChanged(visibility: Int) {
+      if (visibility != android.view.View.VISIBLE) {
+        super.onWindowVisibilityChanged(android.view.View.VISIBLE)
+      } else {
+        super.onWindowVisibilityChanged(visibility)
+      }
+    }
+
+    override fun onWindowFocusChanged(hasWindowFocus: Boolean) {
+      super.onWindowFocusChanged(true)
+    }
   }
 
   override fun onCreate(savedInstanceState: Bundle?) {
@@ -1488,16 +2526,22 @@ class MainActivity : ComponentActivity() {
       insets
     }
 
-    // Back button handling
+    // Back button handling: collapse expanded modal to mini-player or minimize app to background without stopping music
     onBackPressedDispatcher.addCallback(
         this,
         object : OnBackPressedCallback(true) {
           override fun handleOnBackPressed() {
-            if (webView?.canGoBack() == true) {
-              webView?.goBack()
+            val wv = webView
+            if (wv != null) {
+              wv.evaluateJavascript(
+                  "(function() { return (typeof window.handleAndroidBackButton === 'function') ? window.handleAndroidBackButton() : false; })()"
+              ) { result ->
+                if (result != "true") {
+                  moveTaskToBack(true)
+                }
+              }
             } else {
-              isEnabled = false
-              onBackPressedDispatcher.onBackPressed()
+              moveTaskToBack(true)
             }
           }
         })
@@ -1513,9 +2557,8 @@ class MainActivity : ComponentActivity() {
       it.destroy()
     }
 
-    val newWebView = WebView(this)
+    val newWebView = BackgroundAudioWebView(this)
     webView = newWebView
-    newWebView.setLayerType(android.view.View.LAYER_TYPE_HARDWARE, null)
     container.addView(
         newWebView,
         FrameLayout.LayoutParams(
@@ -1605,6 +2648,232 @@ class MainActivity : ComponentActivity() {
               request: WebResourceRequest?
           ): WebResourceResponse? {
             val url = request?.url?.toString() ?: return null
+
+            if (url.startsWith("https://soundwave.app/yt_embed") || url.startsWith("http://soundwave.app/yt_embed")) {
+              val videoId = (request.url.getQueryParameter("v") ?: "").replace(Regex("[^a-zA-Z0-9_-]"), "")
+              val embedHtml = """
+                <!DOCTYPE html>
+                <html>
+                <head>
+                  <meta charset="UTF-8">
+                  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+                  <meta name="referrer" content="strict-origin-when-cross-origin">
+                  <script>
+                    // Manter o player do YouTube ativo em segundo plano mesmo quando o app é minimizado
+                    (function() {
+                      try {
+                        Object.defineProperty(document, 'hidden', { get: function() { return false; }, configurable: true });
+                        Object.defineProperty(document, 'webkitHidden', { get: function() { return false; }, configurable: true });
+                        Object.defineProperty(document, 'visibilityState', { get: function() { return 'visible'; }, configurable: true });
+                        Object.defineProperty(document, 'webkitVisibilityState', { get: function() { return 'visible'; }, configurable: true });
+                        var origDocAdd = document.addEventListener.bind(document);
+                        document.addEventListener = function(type, listener, options) {
+                          if (type === 'visibilitychange' || type === 'webkitvisibilitychange' || type === 'pagehide') {
+                            return;
+                          }
+                          return origDocAdd(type, listener, options);
+                        };
+                        var origWinAdd = window.addEventListener.bind(window);
+                        window.addEventListener = function(type, listener, options) {
+                          if (type === 'pagehide' || type === 'blur') {
+                            return;
+                          }
+                          return origWinAdd(type, listener, options);
+                        };
+                      } catch (e) {}
+                    })();
+                  </script>
+                  <style>
+                    * { margin: 0; padding: 0; box-sizing: border-box; }
+                    html, body { width: 100%; height: 100%; background: #000; overflow: hidden; }
+                    #ytplayer { width: 100%; height: 100%; border: none; }
+                  </style>
+                </head>
+                <body>
+                  <div id="ytplayer"></div>
+                  <script>
+                    var player = null;
+                    var progressTimer = null;
+                    var initialVideoId = "$videoId";
+                    var userPaused = false;
+                    var isBackgroundMode = false;
+
+                    function notifyParent(payload) {
+                      try {
+                        window.parent.postMessage(JSON.stringify(payload), "*");
+                      } catch (e) {}
+                    }
+
+                    function startTimer() {
+                      stopTimer();
+                      progressTimer = setInterval(function() {
+                        if (player && typeof player.getCurrentTime === 'function') {
+                          var cur = player.getCurrentTime() || 0;
+                          var dur = player.getDuration() || 0;
+                          notifyParent({ type: 'yt_progress', current: cur, duration: dur });
+                        }
+                      }, 400);
+                    }
+
+                    function stopTimer() {
+                      if (progressTimer) {
+                        clearInterval(progressTimer);
+                        progressTimer = null;
+                      }
+                    }
+
+                    var tag = document.createElement('script');
+                    tag.src = "https://www.youtube.com/iframe_api";
+                    var firstScriptTag = document.getElementsByTagName('script')[0];
+                    firstScriptTag.parentNode.insertBefore(tag, firstScriptTag);
+
+                    function onYouTubeIframeAPIReady() {
+                      player = new YT.Player('ytplayer', {
+                        width: '100%',
+                        height: '100%',
+                        videoId: initialVideoId,
+                        playerVars: {
+                          autoplay: 1,
+                          playsinline: 1,
+                          controls: 1,
+                          rel: 0,
+                          modestbranding: 1,
+                          enablejsapi: 1,
+                          vq: 'tiny',
+                          origin: 'https://soundwave.app'
+                        },
+                        events: {
+                          onReady: function(event) {
+                            userPaused = false;
+                            notifyParent({ type: 'yt_ready', duration: event.target.getDuration() || 0 });
+                            try {
+                              if (typeof event.target.setPlaybackQuality === 'function') {
+                                event.target.setPlaybackQuality('tiny');
+                              }
+                            } catch (e) {}
+                            try { event.target.playVideo(); } catch (e) {}
+                            startTimer();
+                          },
+                          onStateChange: function(event) {
+                            if (event.data === YT.PlayerState.PLAYING) {
+                              userPaused = false;
+                              try {
+                                if (typeof event.target.setPlaybackQuality === 'function') {
+                                  event.target.setPlaybackQuality('tiny');
+                                }
+                              } catch (e) {}
+                              startTimer();
+                              notifyParent({
+                                type: 'yt_state',
+                                state: 'playing',
+                                isPlaying: true,
+                                duration: player.getDuration() || 0,
+                                current: player.getCurrentTime() || 0
+                              });
+                            } else if (event.data === YT.PlayerState.PAUSED) {
+                              if (!userPaused && isBackgroundMode) {
+                                setTimeout(function() {
+                                  if (!userPaused && player && typeof player.playVideo === 'function') {
+                                    try { player.playVideo(); } catch (e) {}
+                                  }
+                                }, 60);
+                                return;
+                              }
+                              stopTimer();
+                              notifyParent({
+                                type: 'yt_state',
+                                state: 'paused',
+                                isPlaying: false,
+                                duration: player.getDuration() || 0,
+                                current: player.getCurrentTime() || 0
+                              });
+                            } else if (event.data === YT.PlayerState.ENDED) {
+                              stopTimer();
+                              notifyParent({ type: 'yt_ended' });
+                            } else if (event.data === YT.PlayerState.BUFFERING) {
+                              notifyParent({
+                                type: 'yt_state',
+                                state: 'buffering',
+                                isPlaying: !userPaused
+                              });
+                            }
+                          },
+                          onError: function(event) {
+                            stopTimer();
+                            notifyParent({ type: 'yt_error', code: event.data });
+                          }
+                        }
+                      });
+                    }
+
+                    window.addEventListener('message', function(ev) {
+                      try {
+                        var msg = typeof ev.data === 'string' ? JSON.parse(ev.data) : ev.data;
+                        if (!msg) return;
+                        if (msg.cmd === 'set_bg') {
+                          isBackgroundMode = Boolean(msg.value);
+                          if (isBackgroundMode && !userPaused && player && typeof player.playVideo === 'function') {
+                            try { player.playVideo(); } catch (e) {}
+                          }
+                          return;
+                        }
+                        if (!player) return;
+                        if (msg.cmd === 'play' && typeof player.playVideo === 'function') {
+                          userPaused = false;
+                          player.playVideo();
+                          startTimer();
+                          notifyParent({
+                            type: 'yt_state',
+                            state: 'playing',
+                            isPlaying: true,
+                            duration: (typeof player.getDuration === 'function' ? player.getDuration() : 0) || 0,
+                            current: (typeof player.getCurrentTime === 'function' ? player.getCurrentTime() : 0) || 0
+                          });
+                        } else if (msg.cmd === 'pause' && typeof player.pauseVideo === 'function') {
+                          userPaused = true;
+                          stopTimer();
+                          player.pauseVideo();
+                          notifyParent({
+                            type: 'yt_state',
+                            state: 'paused',
+                            isPlaying: false
+                          });
+                        } else if (msg.cmd === 'stop' && typeof player.stopVideo === 'function') {
+                          userPaused = true;
+                          stopTimer();
+                          player.stopVideo();
+                        } else if (msg.cmd === 'seek' && typeof player.seekTo === 'function') {
+                          var targetSec = (typeof msg.seconds === 'number') ? msg.seconds : (parseFloat(msg.value) || 0);
+                          player.seekTo(targetSec, true);
+                        } else if (msg.cmd === 'volume' && typeof player.setVolume === 'function') {
+                          player.setVolume(Math.round((parseFloat(msg.value) || 1) * 100));
+                        } else if (msg.cmd === 'speed' && typeof player.setPlaybackRate === 'function') {
+                          player.setPlaybackRate(parseFloat(msg.value) || 1.0);
+                        } else if (msg.cmd === 'quality' && typeof player.setPlaybackQuality === 'function') {
+                          player.setPlaybackQuality(msg.value || 'tiny');
+                        } else if (msg.cmd === 'load' && msg.videoId && typeof player.loadVideoById === 'function') {
+                          userPaused = false;
+                          player.loadVideoById(msg.videoId);
+                          startTimer();
+                        }
+                      } catch (e) {}
+                    });
+                  </script>
+                </body>
+                </html>
+              """.trimIndent()
+              val headers = mapOf(
+                  "Access-Control-Allow-Origin" to "*",
+                  "Cache-Control" to "no-cache"
+              )
+              return WebResourceResponse(
+                  "text/html",
+                  "UTF-8",
+                  200,
+                  "OK",
+                  headers,
+                  java.io.ByteArrayInputStream(embedHtml.toByteArray(Charsets.UTF_8)))
+            }
 
             if (url.startsWith("https://soundwave.local/cover") || url.startsWith("http://soundwave.local/cover")) {
               try {
@@ -1762,6 +3031,11 @@ class MainActivity : ComponentActivity() {
                 url.contains("incompetech.com/music") ||
                 url.startsWith("https://audio-ssl.itunes.apple.com/") ||
                 url.contains("AudioPreview")) {
+              val mimeType = if (url.endsWith(".mp3") || url.contains("archive.org") || url.contains("incompetech")) "audio/mpeg" else "audio/mp4"
+              val hash = Math.abs(url.hashCode())
+              val ext = if (url.contains(".m4a", true)) ".m4a" else ".mp3"
+              val cacheFile = File(cacheDir, "audio_full_$hash$ext")
+
               try {
                 val okReq =
                     Request.Builder()
@@ -1771,7 +3045,6 @@ class MainActivity : ComponentActivity() {
                 val okResp = okHttpClient.newCall(okReq).execute()
                 val body = okResp.body
                 if (body != null) {
-                  val mimeType = if (url.endsWith(".mp3") || url.contains("archive.org") || url.contains("incompetech")) "audio/mpeg" else "audio/mp4"
                   val headers = mutableMapOf<String, String>()
                   for (i in 0 until okResp.headers.size) {
                     headers[okResp.headers.name(i)] = okResp.headers.value(i)
@@ -1779,6 +3052,9 @@ class MainActivity : ComponentActivity() {
                   headers["Content-Type"] = mimeType
                   headers["Access-Control-Allow-Origin"] = "*"
                   headers["Accept-Ranges"] = "bytes"
+                  if (!cacheFile.exists() && okResp.isSuccessful) {
+                    cacheStreamAudioInBackground(url, cacheFile)
+                  }
                   return WebResourceResponse(
                       mimeType,
                       null,
@@ -1788,7 +3064,22 @@ class MainActivity : ComponentActivity() {
                       body.byteStream())
                 }
               } catch (e: Exception) {
-                Log.w("SoundWave", "Intercept audio error: ${e.message}")
+                Log.w("SoundWave", "Intercept audio error, checking cache: ${e.message}")
+                if (cacheFile.exists() && cacheFile.length() > 30000) {
+                  cacheFile.setLastModified(System.currentTimeMillis())
+                  val headers = mutableMapOf(
+                      "Content-Type" to mimeType,
+                      "Access-Control-Allow-Origin" to "*",
+                      "Accept-Ranges" to "bytes"
+                  )
+                  return WebResourceResponse(
+                      mimeType,
+                      null,
+                      200,
+                      "OK",
+                      headers,
+                      java.io.FileInputStream(cacheFile))
+                }
               }
             }
             return super.shouldInterceptRequest(view, request)
@@ -1829,6 +3120,11 @@ class MainActivity : ComponentActivity() {
     newWebView.setDownloadListener { url, userAgent, _, mimetype, _ ->
       try {
         val fileName = url.substringAfterLast("/", "audio_download.mp3")
+        val soundWaveSubDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "SoundWave")
+        if (!soundWaveSubDir.exists()) {
+          soundWaveSubDir.mkdirs()
+        }
+
         val request =
             DownloadManager.Request(Uri.parse(url)).apply {
               setMimeType(mimetype)
@@ -1837,11 +3133,11 @@ class MainActivity : ComponentActivity() {
               setTitle(fileName)
               setNotificationVisibility(
                   DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-              setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
+              setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, "SoundWave/$fileName")
             }
         val manager = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-        manager.enqueue(request)
-        Toast.makeText(this, "Download iniciado: $fileName", Toast.LENGTH_SHORT).show()
+        val downloadId = manager.enqueue(request)
+        Toast.makeText(this, "⬇️ Download iniciado em Download/SoundWave: $fileName", Toast.LENGTH_SHORT).show()
 
         // Notify SoundWave PWA to add to library automatically
         newWebView.post {
@@ -1851,6 +3147,7 @@ class MainActivity : ComponentActivity() {
               "if (window.onNativeDownloadRegistered) { window.onNativeDownloadRegistered($quotedName, $quotedUrl); }",
               null)
         }
+        monitorDownloadProgress(downloadId, fileName, manager)
       } catch (e: Exception) {
         try {
           val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
@@ -1898,7 +3195,7 @@ class MainActivity : ComponentActivity() {
         Log.w("SoundWave", "Direct seek error: ${e.message}")
       }
       webView?.evaluateJavascript(
-          "if (typeof activeAudioMode !== 'undefined' && activeAudioMode === 'native' && window.AndroidTorrentBridge && typeof window.AndroidTorrentBridge.seekAudioNative === 'function') { window.AndroidTorrentBridge.seekAudioNative($seconds); } else if (typeof audio !== 'undefined') { audio.currentTime = $seconds; }",
+          "if (typeof activeAudioMode !== 'undefined' && activeAudioMode === 'youtube' && typeof sendYouTubePlayerCommand === 'function') { sendYouTubePlayerCommand({ cmd: 'seek', seconds: $seconds }); } else if (typeof activeAudioMode !== 'undefined' && activeAudioMode === 'native' && window.AndroidTorrentBridge && typeof window.AndroidTorrentBridge.seekAudioNative === 'function') { window.AndroidTorrentBridge.seekAudioNative($seconds); } else if (typeof audio !== 'undefined') { audio.currentTime = $seconds; }",
           null
       )
     }
@@ -1925,32 +3222,77 @@ class MainActivity : ComponentActivity() {
     }
   }
 
+  private fun notifyWebViewBackgroundState(inBackground: Boolean) {
+    try {
+      webView?.resumeTimers()
+      webView?.evaluateJavascript(
+          "if (typeof window.onAppBackgroundStateChanged === 'function') { window.onAppBackgroundStateChanged($inBackground); }",
+          null
+      )
+    } catch (_: Exception) {}
+  }
+
   override fun onUserLeaveHint() {
     super.onUserLeaveHint()
+    notifyWebViewBackgroundState(true)
     val prefs = getSharedPreferences("soundwave_prefs", Context.MODE_PRIVATE)
     val bubbleEnabled = prefs.getBoolean("floating_bubble_enabled", true)
-    if (bubbleEnabled && isAudioPlaying && android.provider.Settings.canDrawOverlays(this)) {
-      FloatingBubbleService.show(this, currentTrackTitle, isAudioPlaying)
+    if (isAudioPlaying) {
+      MusicPlaybackService.startOrUpdate(
+          this,
+          currentTrackTitle,
+          currentTrackArtist,
+          true,
+          currentCoverUrl.ifEmpty { null }
+      )
+      if (bubbleEnabled && android.provider.Settings.canDrawOverlays(this)) {
+        FloatingBubbleService.show(
+            this,
+            currentTrackTitle,
+            true,
+            currentCoverUrl.ifEmpty { null }
+        )
+      }
     }
   }
 
   override fun onPause() {
     super.onPause()
+    try {
+      webView?.resumeTimers()
+    } catch (_: Exception) {}
   }
 
   override fun onStop() {
     super.onStop()
+    notifyWebViewBackgroundState(true)
     val prefs = getSharedPreferences("soundwave_prefs", Context.MODE_PRIVATE)
     val bubbleEnabled = prefs.getBoolean("floating_bubble_enabled", true)
-    if (bubbleEnabled && isAudioPlaying && android.provider.Settings.canDrawOverlays(this)) {
-      FloatingBubbleService.show(this, currentTrackTitle, isAudioPlaying)
+    if (isAudioPlaying) {
+      MusicPlaybackService.startOrUpdate(
+          this,
+          currentTrackTitle,
+          currentTrackArtist,
+          true,
+          currentCoverUrl.ifEmpty { null }
+      )
+      if (bubbleEnabled && android.provider.Settings.canDrawOverlays(this)) {
+        FloatingBubbleService.show(
+            this,
+            currentTrackTitle,
+            true,
+            currentCoverUrl.ifEmpty { null }
+        )
+      }
     }
   }
 
   override fun onResume() {
     super.onResume()
     instance = this
+    notifyWebViewBackgroundState(false)
     FloatingBubbleService.hide(this)
+    AppUpdateManager.resumePendingInstallIfAllowed(this)
   }
 
   override fun onDestroy() {

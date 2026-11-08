@@ -92,6 +92,8 @@ class MusicPlaybackService : Service() {
   private val serviceScope = CoroutineScope(Dispatchers.IO + Job())
   private var currentCoverBitmap: Bitmap? = null
   private var lastCoverUrl: String? = null
+  private var wakeLock: android.os.PowerManager.WakeLock? = null
+  private var wifiLock: android.net.wifi.WifiManager.WifiLock? = null
 
   private var currentTitle = "SoundWave"
   private var currentArtist = "Tocando agora"
@@ -104,6 +106,48 @@ class MusicPlaybackService : Service() {
     isServiceRunning = true
     createNotificationChannel()
     setupMediaSession()
+    initLocks()
+  }
+
+  private fun initLocks() {
+    try {
+      val pm = getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
+      wakeLock = pm?.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "SoundWave::BackgroundPlaybackWakeLock")?.apply {
+        setReferenceCounted(false)
+      }
+      val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as? android.net.wifi.WifiManager
+      @Suppress("DEPRECATION")
+      val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        android.net.wifi.WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+      } else {
+        android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF
+      }
+      wifiLock = wm?.createWifiLock(mode, "SoundWave::BackgroundWifiLock")?.apply {
+        setReferenceCounted(false)
+      }
+    } catch (e: Exception) {
+      Log.w("MusicPlaybackService", "Failed to init locks: ${e.message}")
+    }
+  }
+
+  private fun updateLocks(playing: Boolean) {
+    try {
+      if (playing) {
+        if (wakeLock?.isHeld == false) {
+          wakeLock?.acquire(4 * 60 * 60 * 1000L) // up to 4h continuous playback
+        }
+        if (wifiLock?.isHeld == false) {
+          wifiLock?.acquire()
+        }
+      } else {
+        if (wakeLock?.isHeld == true) {
+          wakeLock?.release()
+        }
+        if (wifiLock?.isHeld == true) {
+          wifiLock?.release()
+        }
+      }
+    } catch (_: Exception) {}
   }
 
   override fun onBind(intent: Intent?): IBinder? = null
@@ -111,6 +155,7 @@ class MusicPlaybackService : Service() {
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
     when (intent?.action) {
       ACTION_STOP_SERVICE -> {
+        updateLocks(false)
         stopPlaybackNotification()
         return START_NOT_STICKY
       }
@@ -121,6 +166,7 @@ class MusicPlaybackService : Service() {
         val coverUrl = intent.getStringExtra(EXTRA_COVER_URL)
         currentDurationMs = intent.getLongExtra(EXTRA_DURATION_MS, 0L)
         currentPositionMs = intent.getLongExtra(EXTRA_POSITION_MS, 0L)
+        updateLocks(isPlaying)
 
         if (coverUrl.isNullOrEmpty()) {
           lastCoverUrl = null
@@ -129,18 +175,25 @@ class MusicPlaybackService : Service() {
           showNotification()
         } else if (coverUrl != lastCoverUrl) {
           lastCoverUrl = coverUrl
-          currentCoverBitmap = null
-          updateMediaSessionState()
-          showNotification()
+          val cached = CoverLoader.getCached(coverUrl)
+          if (cached != null) {
+            currentCoverBitmap = cached
+            updateMediaSessionState()
+            showNotification()
+          } else {
+            currentCoverBitmap = null
+            updateMediaSessionState()
+            showNotification()
 
-          val targetUrl = coverUrl
-          serviceScope.launch {
-            val bmp = downloadBitmap(targetUrl)
-            withContext(Dispatchers.Main) {
-              if (lastCoverUrl == targetUrl && bmp != null) {
-                currentCoverBitmap = bmp
-                updateMediaSessionState()
-                showNotification()
+            val targetUrl = coverUrl
+            serviceScope.launch {
+              val bmp = CoverLoader.loadBitmap(this@MusicPlaybackService, targetUrl)
+              withContext(Dispatchers.Main) {
+                if (lastCoverUrl == targetUrl && bmp != null) {
+                  currentCoverBitmap = bmp
+                  updateMediaSessionState()
+                  showNotification()
+                }
               }
             }
           }
@@ -233,6 +286,8 @@ class MusicPlaybackService : Service() {
 
     if (currentCoverBitmap != null) {
       metadataBuilder.putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, currentCoverBitmap)
+      metadataBuilder.putBitmap(MediaMetadata.METADATA_KEY_ART, currentCoverBitmap)
+      metadataBuilder.putBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON, currentCoverBitmap)
     }
 
     mediaSession?.setMetadata(metadataBuilder.build())
@@ -364,6 +419,8 @@ class MusicPlaybackService : Service() {
       } else {
         startForeground(NOTIFICATION_ID, notification)
       }
+      val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+      manager.notify(NOTIFICATION_ID, notification)
     } catch (e: Exception) {
       Log.w("MusicPlaybackService", "Error entering foreground: ${e.message}")
     }
@@ -383,78 +440,12 @@ class MusicPlaybackService : Service() {
   }
 
   private fun downloadBitmap(urlStr: String): Bitmap? {
-    return try {
-      if (urlStr.contains("soundwave.local")) {
-        val parsedUri = android.net.Uri.parse(urlStr)
-        val targetUriStr = parsedUri.getQueryParameter("uri")
-        if (!targetUriStr.isNullOrEmpty()) {
-          val localUri = android.net.Uri.parse(android.net.Uri.decode(targetUriStr))
-          val uriKey = localUri.toString()
-
-          if (urlStr.contains("audio_cover")) {
-            // 1. Try MediaStore albumart Content URI first
-            try {
-              contentResolver.query(
-                  localUri,
-                  arrayOf(android.provider.MediaStore.Audio.Media.ALBUM_ID),
-                  null,
-                  null,
-                  null
-              )?.use { cursor ->
-                if (cursor.moveToFirst()) {
-                  val albumIdCol = cursor.getColumnIndex(android.provider.MediaStore.Audio.Media.ALBUM_ID)
-                  if (albumIdCol != -1) {
-                    val albumId = cursor.getLong(albumIdCol)
-                    if (albumId > 0) {
-                      val artUri = android.content.ContentUris.withAppendedId(
-                          android.net.Uri.parse("content://media/external/audio/albumart"), albumId)
-                      contentResolver.openInputStream(artUri)?.use { stream ->
-                        val bmp = BitmapFactory.decodeStream(stream)
-                        if (bmp != null) return bmp
-                      }
-                    }
-                  }
-                }
-              }
-            } catch (_: Exception) {}
-
-            // 2. Try system thumbnail loader on API 29+
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-              try {
-                return contentResolver.loadThumbnail(localUri, android.util.Size(400, 400), null)
-              } catch (_: Exception) {}
-            }
-
-
-          } else {
-            contentResolver.openInputStream(localUri)?.use { stream ->
-              return BitmapFactory.decodeStream(stream)
-            }
-          }
-        }
-      } else if (urlStr.startsWith("content://") || urlStr.startsWith("file://")) {
-        val localUri = android.net.Uri.parse(urlStr)
-        contentResolver.openInputStream(localUri)?.use { stream ->
-          return BitmapFactory.decodeStream(stream)
-        }
-      }
-
-      val url = URL(urlStr)
-      val connection = url.openConnection() as HttpURLConnection
-      connection.connectTimeout = 8000
-      connection.readTimeout = 8000
-      connection.doInput = true
-      connection.connect()
-      val input: InputStream = connection.inputStream
-      BitmapFactory.decodeStream(input)
-    } catch (e: Exception) {
-      Log.w("MusicPlaybackService", "Error loading cover bitmap for $urlStr: ${e.message}")
-      null
-    }
+    return CoverLoader.loadBitmap(this, urlStr)
   }
 
   override fun onDestroy() {
     isServiceRunning = false
+    updateLocks(false)
     mediaSession?.release()
     mediaSession = null
     super.onDestroy()
